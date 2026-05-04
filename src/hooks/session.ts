@@ -5,10 +5,10 @@
  * and provides structured logging for session events.
  */
 
-import { readFile, writeFile, mkdir, unlink, appendFile } from 'fs/promises';
-import { dirname, join, resolve as resolvePath } from 'path';
+import { readFile, writeFile, mkdir, unlink, appendFile, rm } from 'fs/promises';
+import { dirname, join } from 'path';
 import { existsSync, readFileSync } from 'fs';
-import { omxStateDir, omxLogsDir } from '../utils/paths.js';
+import { omxStateDir, omxLogsDir, sameFilePath } from '../utils/paths.js';
 import { getStateFilePath } from '../mcp/state-paths.js';
 
 export interface SessionState {
@@ -20,6 +20,7 @@ export interface SessionState {
   platform?: NodeJS.Platform;
   pid_start_ticks?: number;
   pid_cmdline?: string;
+  tmux_session_name?: string;
 }
 
 const SESSION_FILE = 'session.json';
@@ -34,6 +35,30 @@ function sessionPath(cwd: string): string {
 
 function historyPath(cwd: string): string {
   return join(omxLogsDir(cwd), HISTORY_FILE);
+}
+
+async function removeDeadSessionHudState(
+  cwd: string,
+  sessionIds: Array<string | undefined>,
+): Promise<void> {
+  const uniqueSessionIds = [...new Set(
+    sessionIds
+      .filter((value): value is string => typeof value === 'string' && value.trim().length > 0)
+      .map((value) => value.trim()),
+  )];
+
+  const candidatePaths = [
+    getStateFilePath('hud-state.json', cwd),
+    ...uniqueSessionIds.map((sessionId) => getStateFilePath('hud-state.json', cwd, sessionId)),
+  ];
+
+  await Promise.all(candidatePaths.map(async (path) => {
+    try {
+      await rm(path, { force: true });
+    } catch {
+      // best effort only
+    }
+  }));
 }
 
 /**
@@ -87,7 +112,7 @@ export function isSessionStateAuthoritativeForCwd(state: SessionState, cwd: stri
   if (!SESSION_ID_PATTERN.test(state.session_id)) return false;
 
   if (typeof state.cwd === 'string' && state.cwd.trim() !== '') {
-    return resolvePath(state.cwd) === resolvePath(cwd);
+    return sameFilePath(state.cwd, cwd);
   }
 
   return true;
@@ -134,6 +159,7 @@ interface SessionStartOptions {
   pid?: number;
   platform?: NodeJS.Platform;
   nativeSessionId?: string;
+  tmuxSessionName?: string;
 }
 
 function defaultIsPidAlive(pid: number): boolean {
@@ -197,11 +223,15 @@ function createSessionState(
     nowIso?: string;
     nativeSessionId?: string;
     startedAt?: string;
+    tmuxSessionName?: string;
   } = {},
 ): SessionState {
   const nowIso = options.nowIso ?? new Date().toISOString();
   const nativeSessionId = typeof options.nativeSessionId === 'string' && options.nativeSessionId.trim()
     ? options.nativeSessionId.trim()
+    : undefined;
+  const tmuxSessionName = typeof options.tmuxSessionName === 'string' && options.tmuxSessionName.trim()
+    ? options.tmuxSessionName.trim()
     : undefined;
 
   return {
@@ -213,6 +243,7 @@ function createSessionState(
     platform,
     pid_start_ticks: linuxIdentity?.startTicks,
     pid_cmdline: linuxIdentity?.cmdline ?? undefined,
+    ...(tmuxSessionName ? { tmux_session_name: tmuxSessionName } : {}),
   };
 }
 
@@ -269,6 +300,7 @@ export async function writeSessionStart(
     : null;
   const state = createSessionState(cwd, sessionId, pid, platform, linuxIdentity, {
     nativeSessionId: options.nativeSessionId,
+    tmuxSessionName: options.tmuxSessionName,
   });
 
   await writeFile(sessionPath(cwd), JSON.stringify(state, null, 2));
@@ -303,6 +335,16 @@ export async function reconcileNativeSessionStart(
     });
   }
 
+  const existingNativeSessionId = typeof existing.native_session_id === 'string'
+    ? existing.native_session_id.trim()
+    : '';
+  if (existingNativeSessionId && existingNativeSessionId !== nativeSessionId) {
+    return await writeSessionStart(cwd, nativeSessionId, {
+      ...options,
+      nativeSessionId,
+    });
+  }
+
   const pid = Number.isInteger(options.pid) && options.pid && options.pid > 0
     ? options.pid
     : process.pid;
@@ -315,6 +357,7 @@ export async function reconcileNativeSessionStart(
     nowIso,
     nativeSessionId,
     startedAt: existing.started_at,
+    tmuxSessionName: existing.tmux_session_name,
   });
 
   await writeFile(sessionPath(cwd), JSON.stringify(state, null, 2));
@@ -349,6 +392,12 @@ export async function writeSessionEnd(cwd: string, sessionId: string): Promise<v
   };
 
   await appendFile(historyPath(cwd), JSON.stringify(historyEntry) + '\n');
+
+  await removeDeadSessionHudState(cwd, [
+    state?.session_id,
+    state?.native_session_id,
+    sessionId,
+  ]);
 
   // Delete session.json
   try {

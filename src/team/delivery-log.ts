@@ -5,6 +5,7 @@ export type TeamDeliveryEventName =
   | 'mailbox_created'
   | 'dispatch_attempted'
   | 'dispatch_result'
+  | 'startup_timing'
   | 'delivered'
   | 'mark_delivered'
   | 'nudge_triggered';
@@ -19,6 +20,7 @@ export type TeamDeliveryResult =
   | 'missing'
   | 'retry'
   | 'deferred'
+  | 'suppressed'
   | 'sent'
   | 'failed';
 

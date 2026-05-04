@@ -5,7 +5,8 @@
 
 import { readFile, writeFile, mkdir, appendFile, rename, stat, readdir } from 'fs/promises';
 import { existsSync } from 'fs';
-import { join, resolve as resolvePath } from 'path';
+import { join } from 'path';
+import { resolveWorkerNotifyTeamStateRootPath } from '../../team/state-root.js';
 import { asNumber, safeString, isTerminalPhase } from './utils.js';
 import { readJsonIfExists } from './state-io.js';
 import { logTmuxHookEvent } from './log.js';
@@ -19,55 +20,10 @@ import {
 import { DEFAULT_MARKER } from '../tmux-hook-engine.js';
 const LEADER_PANE_SHELL_NO_INJECTION_REASON = 'leader_pane_shell_no_injection';
 
-async function readTeamStateRootFromJson(path) {
-  try {
-    if (!existsSync(path)) return null;
-    const parsed = JSON.parse(await readFile(path, 'utf-8'));
-    const value = parsed && typeof parsed.team_state_root === 'string'
-      ? parsed.team_state_root.trim()
-      : '';
-    return value ? value : null;
-  } catch {
-    return null;
-  }
-}
-
 export async function resolveTeamStateDirForWorker(cwd, parsedTeamWorker) {
-  const explicitStateRoot = safeString(process.env.OMX_TEAM_STATE_ROOT || '').trim();
-  if (explicitStateRoot) {
-    return resolvePath(cwd, explicitStateRoot);
-  }
-
-  const teamName = parsedTeamWorker.teamName;
-  const workerName = parsedTeamWorker.workerName;
-  const leaderCwd = safeString(process.env.OMX_TEAM_LEADER_CWD || '').trim();
-
-  const candidateStateDirs = [];
-  if (leaderCwd) {
-    candidateStateDirs.push(join(resolvePath(leaderCwd), '.omx', 'state'));
-  }
-  candidateStateDirs.push(join(cwd, '.omx', 'state'));
-
-  for (const candidateStateDir of candidateStateDirs) {
-    const teamRoot = join(candidateStateDir, 'team', teamName);
-    if (!existsSync(teamRoot)) continue;
-
-    const identityRoot = await readTeamStateRootFromJson(
-      join(teamRoot, 'workers', workerName, 'identity.json'),
-    );
-    if (identityRoot) return resolvePath(cwd, identityRoot);
-
-    const manifestRoot = await readTeamStateRootFromJson(join(teamRoot, 'manifest.v2.json'));
-    if (manifestRoot) return resolvePath(cwd, manifestRoot);
-
-    const configRoot = await readTeamStateRootFromJson(join(teamRoot, 'config.json'));
-    if (configRoot) return resolvePath(cwd, configRoot);
-
-    return candidateStateDir;
-  }
-
-  return join(cwd, '.omx', 'state');
+  return resolveWorkerNotifyTeamStateRootPath(cwd, parsedTeamWorker, process.env);
 }
+
 
 export function parseTeamWorkerEnv(rawValue) {
   if (typeof rawValue !== 'string') return null;
@@ -458,7 +414,7 @@ export async function maybeNotifyLeaderAllWorkersIdle({ cwd, stateDir, logsDir, 
   }
 
   const N = workers.length;
-  const nextAction = `Next: run omx team status ${teamName}, read unread worker messages, then decide whether to assign the next concrete task, reconcile results, or shut the team down.`;
+  const nextAction = `Run \`omx team status ${teamName}\` now, read unread worker messages, then assign the next concrete task, reconcile results, or shut the team down.`;
   const message = `[OMX] All ${N} worker${N === 1 ? '' : 's'} idle. ${nextAction} ${DEFAULT_MARKER}`;
   const tmuxTarget = canonicalLeaderPaneId;
   const paneGuard = await checkLeaderPaneReadyForWorkerStateReminder(tmuxTarget);

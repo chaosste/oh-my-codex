@@ -12,7 +12,7 @@ describe('reconcileHudForPromptSubmit', () => {
   });
 
   it('recreates a missing HUD in tmux', async () => {
-    const created: Array<{ cwd: string; cmd: string; options?: { heightLines?: number; fullWidth?: boolean } }> = [];
+    const created: Array<{ cwd: string; cmd: string; options?: { heightLines?: number; fullWidth?: boolean; targetPaneId?: string } }> = [];
     const resized: Array<{ paneId: string; heightLines: number }> = [];
 
     const result = await reconcileHudForPromptSubmit('/repo', {
@@ -38,6 +38,54 @@ describe('reconcileHudForPromptSubmit', () => {
     assert.equal(created[0]?.options?.heightLines, 3);
     assert.equal(resized.length, 1);
     assert.equal(resized[0]?.heightLines, 3);
+  });
+
+  it('prefers an explicit session override when recreating HUD', async () => {
+    const created: Array<{ cmd: string }> = [];
+
+    const result = await reconcileHudForPromptSubmit('/repo', {
+      env: { TMUX: '1', TMUX_PANE: '%1', OMX_SESSION_ID: 'sess-stale' },
+      sessionId: 'sess-canonical',
+      listCurrentWindowPanes: () => [
+        { paneId: '%1', currentCommand: 'codex', startCommand: 'codex' },
+      ],
+      createHudWatchPane: (_cwd, cmd) => {
+        created.push({ cmd });
+        return '%9';
+      },
+      resizeTmuxPane: () => true,
+      resolveOmxCliEntryPath: () => '/repo/dist/cli/omx.js',
+    });
+
+    assert.equal(result.status, 'recreated');
+    assert.equal(created.length, 1);
+    assert.match(created[0]?.cmd || '', /^OMX_SESSION_ID='sess-canonical' node '.*omx\.js' hud --watch/);
+    assert.doesNotMatch(created[0]?.cmd || '', /sess-stale/);
+  });
+
+  it('targets the emitting pane window when listing and creating HUD panes', async () => {
+    const listArgs: Array<string | undefined> = [];
+    const created: Array<{ options?: { heightLines?: number; fullWidth?: boolean; targetPaneId?: string } }> = [];
+
+    const result = await reconcileHudForPromptSubmit('/repo', {
+      env: { TMUX: '1', TMUX_PANE: '%leader' },
+      listCurrentWindowPanes: (currentPaneId) => {
+        listArgs.push(currentPaneId);
+        return [
+          { paneId: '%leader', currentCommand: 'codex', startCommand: 'codex' },
+        ];
+      },
+      createHudWatchPane: (_cwd, _cmd, options) => {
+        created.push({ options });
+        return '%hud';
+      },
+      resizeTmuxPane: () => true,
+      resolveOmxCliEntryPath: () => '/repo/dist/cli/omx.js',
+    });
+
+    assert.equal(result.status, 'recreated');
+    assert.deepEqual(listArgs, ['%leader']);
+    assert.equal(created[0]?.options?.targetPaneId, '%leader');
   });
 
   it('kills duplicate HUD panes and recreates one full-width pane', async () => {

@@ -190,10 +190,10 @@ Notas:
 - Arquivos `AGENTS.md` existentes nunca são sobrescritos silenciosamente: em TTY interativo o setup pergunta antes de substituir; em modo não interativo a substituição é ignorada, a menos que você use `--force` (verificações de segurança de sessões ativas continuam valendo).
 - Atualizações do `config.toml` (para ambos os escopos):
   - `notify = ["node", "..."]`
-  - `model_reasoning_effort = "high"`
+  - `model_reasoning_effort = "medium"`
   - `developer_instructions = "..."`
   - `[features] multi_agent = true, child_agents_md = true`
-  - Entradas de servidores MCP (`omx_state`, `omx_memory`, `omx_code_intel`, `omx_trace`)
+  - Entradas de servidores MCP (`omx_state`, `omx_memory`, `omx_code_intel`, `omx_trace`, `omx_wiki`)
   - `[tui] status_line`
 - `AGENTS.md` específico do escopo
 - Diretórios `.omx/` de execução e configuração do HUD

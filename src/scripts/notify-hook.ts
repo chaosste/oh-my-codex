@@ -20,7 +20,7 @@
 
 import { writeFile, appendFile, mkdir, readFile } from 'fs/promises';
 import { existsSync } from 'fs';
-import { dirname, join } from 'path';
+import { dirname, join, resolve } from 'path';
 
 import { safeString, asNumber } from './notify-hook/utils.js';
 import {
@@ -40,7 +40,13 @@ import {
 import { isLeaderStale, resolveLeaderStalenessThresholdMs, maybeNudgeTeamLeader } from './notify-hook/team-leader-nudge.js';
 import { drainPendingTeamDispatch } from './notify-hook/team-dispatch.js';
 import { handleTmuxInjection } from './notify-hook/tmux-injection.js';
-import { maybeAutoNudge, resolveNudgePaneTarget, isDeepInterviewStateActive } from './notify-hook/auto-nudge.js';
+import {
+  maybeAutoNudge,
+  resolveNudgePaneTarget,
+  isDeepInterviewStateActive,
+  isDeepInterviewInputLockActive,
+  syncSkillStateFromTurn,
+} from './notify-hook/auto-nudge.js';
 import { isManagedOmxSession } from './notify-hook/managed-tmux.js';
 import { logNotifyHookEvent } from './notify-hook/log.js';
 import { reconcileRalphSessionResume } from './notify-hook/ralph-session-resume.js';
@@ -173,13 +179,15 @@ async function main() {
   const isTurnComplete = isTurnCompletePayload(payload);
 
   // Team worker detection via environment variable
-  const teamWorkerEnv = process.env.OMX_TEAM_WORKER; // e.g., "fix-ts/worker-1"
+  const teamWorkerEnv = process.env.OMX_TEAM_INTERNAL_WORKER || process.env.OMX_TEAM_WORKER; // e.g., "fix-ts/worker-1"
   const parsedTeamWorker = parseTeamWorkerEnv(teamWorkerEnv);
   const isTeamWorker = !!parsedTeamWorker;
 
-  const stateDir = (isTeamWorker && parsedTeamWorker)
+  const resolvedWorkerStateDir = (isTeamWorker && parsedTeamWorker)
     ? await resolveTeamStateDirForWorker(cwd, parsedTeamWorker)
-    : join(cwd, '.omx', 'state');
+    : null;
+  const workerStateRootResolved = !isTeamWorker || !!resolvedWorkerStateDir;
+  const stateDir = resolvedWorkerStateDir || join(cwd, '.omx', 'state');
   const logsDir = join(cwd, '.omx', 'logs');
   const omxDir = join(cwd, '.omx');
   let currentOmxSessionId = '';
@@ -187,12 +195,15 @@ async function main() {
 
   // Ensure directories exist
   await mkdir(logsDir, { recursive: true }).catch(() => {});
-  await mkdir(stateDir, { recursive: true }).catch(() => {});
-  currentOmxSessionId = await readCurrentSessionId(stateDir).catch(() => '') || '';
+  if (workerStateRootResolved) {
+    await mkdir(stateDir, { recursive: true }).catch(() => {});
+    currentOmxSessionId = await readCurrentSessionId(stateDir).catch(() => '') || '';
+  }
 
   // Turn-level dedupe prevents double-processing when native notify and fallback
   // watcher both emit the same completed turn.
   try {
+    if (!workerStateRootResolved) throw new Error('worker_state_root_unresolved');
     const turnId = safeString(payload['turn-id'] || payload.turn_id || '');
     if (turnId) {
       const now = Date.now();
@@ -238,14 +249,19 @@ async function main() {
   }
 
   // 1. Log the turn
+  const normalizedInputMessages = normalizeInputMessages(payload);
+  const latestInputPreview = safeString(
+    normalizedInputMessages.length > 0
+      ? normalizedInputMessages[normalizedInputMessages.length - 1]
+      : '',
+  ).slice(0, 200);
   const logEntry = {
     timestamp: new Date().toISOString(),
     type: payload.type || 'agent-turn-complete',
     thread_id: payload['thread-id'] || payload.thread_id,
     turn_id: payload['turn-id'] || payload.turn_id,
-    input_preview: (payload['input-messages'] || payload.input_messages || [])
-      .map((m: any) => m.slice(0, 100))
-      .join('; '),
+    input_preview: latestInputPreview,
+    input_message_count: normalizedInputMessages.length,
     output_preview: (payload['last-assistant-message'] || payload.last_assistant_message || '')
       .slice(0, 200),
   };
@@ -254,6 +270,32 @@ async function main() {
   await appendFile(logFile, JSON.stringify(logEntry) + '\n').catch(() => {});
 
   if (!isTurnComplete) {
+    return;
+  }
+
+  if (isTeamWorker && !workerStateRootResolved) {
+    await logNotifyHookEvent(logsDir, {
+      timestamp: new Date().toISOString(),
+      level: 'warn',
+      type: 'team_worker_state_root_unresolved',
+      team_worker: teamWorkerEnv || null,
+      reason: 'skip_team_worker_state_mutations',
+    }).catch(() => {});
+
+    // Keep the fail-closed worker state-root behavior for normal team-worker
+    // mutations, but allow the narrow auto-nudge path to use an explicitly
+    // supplied, already-existing worker state root. Auto-nudge only needs the
+    // worker-scoped state files/pane anchor and should not fall back to creating
+    // local `.omx/state` when identity resolution failed.
+    const explicitWorkerStateRoot = safeString(process.env.OMX_TEAM_STATE_ROOT || '').trim();
+    const autoNudgeStateDir = explicitWorkerStateRoot ? resolve(cwd, explicitWorkerStateRoot) : '';
+    if (autoNudgeStateDir && existsSync(autoNudgeStateDir)) {
+      try {
+        await maybeAutoNudge({ cwd, stateDir: autoNudgeStateDir, logsDir, payload });
+      } catch {
+        // Non-critical
+      }
+    }
     return;
   }
 
@@ -473,7 +515,14 @@ async function main() {
     // Non-fatal: keyword detector module may not be built yet
   }
 
+  try {
+    await syncSkillStateFromTurn(stateDir, payload);
+  } catch {
+    // Non-fatal: lifecycle sync should not block the hook
+  }
+
   const deepInterviewStateActive = await isDeepInterviewStateActive(stateDir, getEffectiveSessionId());
+  const deepInterviewInputLockActive = await isDeepInterviewInputLockActive(stateDir, getEffectiveSessionId());
 
   // 4.55. Notify leader when individual worker transitions to idle (worker session only)
   if (isTeamWorker && parsedTeamWorker && !deepInterviewStateActive) {
@@ -586,13 +635,8 @@ async function main() {
         shouldSendSessionIdleHookEvent,
         recordSessionIdleHookEventSent,
       } = await import('../notifications/idle-cooldown.js');
-      const sessionJsonPath = join(stateDir, 'session.json');
       const idleFingerprint = buildIdleNotificationFingerprint(payload);
-      let notifySessionId = '';
-      try {
-        const sessionData = JSON.parse(await readFile(sessionJsonPath, 'utf-8'));
-        notifySessionId = safeString(sessionData && sessionData.session_id ? sessionData.session_id : '');
-      } catch { /* no session file */ }
+      const notifySessionId = getEffectiveSessionId();
 
       const shouldNotifyLifecycle = notifySessionId
         && shouldSendIdleNotification(stateDir, notifySessionId, idleFingerprint);
@@ -647,7 +691,7 @@ async function main() {
 
   // 9. Auto-nudge: detect Codex stall patterns and automatically send a continuation prompt.
   //    Works for both leader and worker contexts.
-  if (!deepInterviewStateActive) {
+  if (!deepInterviewStateActive || deepInterviewInputLockActive) {
     try {
       await maybeAutoNudge({ cwd, stateDir, logsDir, payload });
     } catch {

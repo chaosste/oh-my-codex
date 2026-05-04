@@ -40,6 +40,11 @@ import {
   listActiveSkills,
   readVisibleSkillActiveState,
 } from "../state/skill-active.js";
+import {
+  OMX_GENERATED_AGENTS_MARKER,
+  OMX_MANAGED_AGENTS_END_MARKER,
+  OMX_MANAGED_AGENTS_START_MARKER,
+} from "../utils/agents-md.js";
 
 const START_MARKER = "<!-- OMX:RUNTIME:START -->";
 const END_MARKER = "<!-- OMX:RUNTIME:END -->";
@@ -174,6 +179,9 @@ async function isRalphActive(
   cwd: string,
   sessionId?: string,
 ): Promise<boolean> {
+  if (sessionId && !existsSync(getStateDir(cwd, sessionId))) {
+    return false;
+  }
   const refs = await listModeStateFilesWithScopePreference(cwd, sessionId);
   const ralphRef = refs.find((ref) => ref.mode === "ralph");
   if (!ralphRef) return false;
@@ -201,6 +209,9 @@ async function readActiveModes(
   cwd: string,
   sessionId?: string,
 ): Promise<string> {
+  if (sessionId && !existsSync(getStateDir(cwd, sessionId))) {
+    return "";
+  }
   const refs = await listModeStateFilesWithScopePreference(cwd, sessionId);
   const canonicalState = await readVisibleSkillActiveState(cwd, sessionId);
   const canonicalSkills = new Map(
@@ -224,7 +235,6 @@ async function readActiveModes(
     try {
       if (
         !useCompatibilityFallback &&
-        ref.mode !== "autoresearch" &&
         !canonicalSkills.has(ref.mode)
       ) {
         continue;
@@ -327,6 +337,9 @@ export async function resolveSessionOrchestrationMode(
 ): Promise<SessionOrchestrationMode> {
   if (activeSkill === "team") return "team";
   if (activeSkill) return "default";
+  if (sessionId && !existsSync(getStateDir(cwd, sessionId))) {
+    return "default";
+  }
 
   const scopedStateDirs = await getReadScopedStateDirs(cwd, sessionId);
   for (const stateDir of scopedStateDirs) {
@@ -619,6 +632,30 @@ function dropShadowedSkillReferenceLines(
   return keptLines.join("\n");
 }
 
+function stripOmxManagedAgentsBlocks(content: string): string {
+  let next = content;
+
+  while (true) {
+    const startIndex = next.indexOf(OMX_MANAGED_AGENTS_START_MARKER);
+    if (startIndex < 0) return next;
+
+    const endIndex = next.indexOf(
+      OMX_MANAGED_AGENTS_END_MARKER,
+      startIndex + OMX_MANAGED_AGENTS_START_MARKER.length,
+    );
+    if (endIndex < 0) return next;
+
+    const replaceEnd = endIndex + OMX_MANAGED_AGENTS_END_MARKER.length;
+    next = `${next.slice(0, startIndex)}${next.slice(replaceEnd)}`;
+  }
+}
+
+function stripGeneratedOmxAgentsForSession(content: string): string {
+  const withoutManagedBlocks = stripOmxManagedAgentsBlocks(content).trim();
+  if (withoutManagedBlocks.includes(OMX_GENERATED_AGENTS_MARKER)) return "";
+  return withoutManagedBlocks;
+}
+
 /**
  * Build a session-scoped AGENTS.md that combines user-level CODEX_HOME
  * instructions, project instructions (if any), and the runtime overlay,
@@ -648,6 +685,7 @@ export async function writeSessionModelInstructionsFile(
 
     let content = await readFile(sourcePath, "utf-8");
     content = stripOverlayContent(content).trim();
+    content = stripGeneratedOmxAgentsForSession(content);
     if (sourcePath === join(codexHome(), "AGENTS.md")) {
       content = dropShadowedSkillReferenceLines(
         content,

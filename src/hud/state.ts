@@ -6,14 +6,15 @@
 
 import { readFile } from 'fs/promises';
 import { readFileSync } from 'fs';
-import { execSync } from 'child_process';
+import { execFileSync } from 'child_process';
 import { join, dirname, basename } from 'path';
 import { fileURLToPath } from 'url';
 import { omxStateDir } from '../utils/paths.js';
 import { findGitLayout, readGitLayoutFile } from '../utils/git-layout.js';
 import { getDefaultBridge, isBridgeEnabled } from '../runtime/bridge.js';
 import type { RuntimeSnapshot } from '../runtime/bridge.js';
-import { getReadScopedStateFilePaths, getReadScopedStatePaths } from '../mcp/state-paths.js';
+import { getReadScopedStateFilePaths, getReadScopedStatePaths, readCurrentSessionId } from '../mcp/state-paths.js';
+import { teamReadPhase as readTeamPhase } from '../team/team-ops.js';
 import { readUsableSessionState } from '../hooks/session.js';
 import { listActiveSkills, readVisibleSkillActiveState } from '../state/skill-active.js';
 import type {
@@ -46,9 +47,9 @@ async function readJsonFile<T>(path: string): Promise<T | null> {
 
 async function readSessionAwareModeState<T>(cwd: string, mode: string): Promise<T | null> {
   const candidates = await getReadScopedStatePaths(mode, cwd);
-  const session = await readSessionState(cwd);
+  const sessionId = await readCurrentSessionId(cwd);
 
-  if (session?.session_id) {
+  if (sessionId) {
     if (candidates.length === 0) return null;
     return readJsonFile<T>(candidates[0]);
   }
@@ -81,6 +82,9 @@ export function normalizeHudConfig(raw: HudConfig | null | undefined): ResolvedH
     git: {
       ...DEFAULT_HUD_CONFIG.git,
     },
+    statusLine: {
+      preset: DEFAULT_HUD_CONFIG.statusLine.preset,
+    },
   };
 
   if (!raw || typeof raw !== 'object') return normalized;
@@ -99,6 +103,12 @@ export function normalizeHudConfig(raw: HudConfig | null | undefined): ResolvedH
 
     const repoLabel = sanitizeOptionalString(raw.git.repoLabel);
     if (repoLabel) normalized.git.repoLabel = repoLabel;
+  }
+
+  if (raw.statusLine && typeof raw.statusLine === 'object') {
+    if (isValidPreset(raw.statusLine.preset)) {
+      normalized.statusLine.preset = raw.statusLine.preset;
+    }
   }
 
   return normalized;
@@ -215,8 +225,9 @@ function runGit(cwd: string, args: string[]): string | null {
           const config = readGitLayoutFile(gitLayout.gitDir, 'config')
             ?? readGitLayoutFile(gitLayout.commonDir, 'config');
           if (config) {
+            const escaped = remoteName.replace(/[-/\\^$*+?.()|[\]{}]/g, '\\$&');
             const re = new RegExp(
-              `\\[remote "${remoteName}"\\][\\s\\S]*?url\\s*=\\s*(.+)`,
+              `\\[remote "${escaped}"\\][\\s\\S]*?url\\s*=\\s*(.+)`,
               'm',
             );
             const m = config.match(re);
@@ -247,7 +258,7 @@ function runGit(cwd: string, args: string[]): string | null {
 
 function runGitExec(cwd: string, args: string[]): string | null {
   try {
-    return execSync(`git ${args.join(' ')}`, {
+    return execFileSync('git', args, {
       cwd,
       encoding: 'utf-8',
       timeout: 2000,
@@ -349,16 +360,37 @@ function mergePhase<T extends { active?: boolean; current_phase?: string }>(
   return { active: true, current_phase: canonicalPhase } as T;
 }
 
+async function readCanonicalTeamPhase(cwd: string, teamDetail: TeamStateForHud | null): Promise<string | undefined> {
+  const teamName = sanitizeOptionalString(teamDetail?.team_name);
+  if (!teamName) return undefined;
+  const phaseState = await readTeamPhase(teamName, cwd).catch(() => null);
+  return sanitizeOptionalString(phaseState?.current_phase);
+}
+
+function mergeTeamPhase(
+  detail: TeamStateForHud | null,
+  canonicalSkillPhase?: string,
+  canonicalTeamPhase?: string,
+): TeamStateForHud | null {
+  const canonicalPhase = canonicalTeamPhase || canonicalSkillPhase;
+  if (detail?.active === true) {
+    return canonicalPhase ? { ...detail, current_phase: canonicalPhase } : detail;
+  }
+  if (!canonicalPhase) return null;
+  return { active: true, current_phase: canonicalPhase };
+}
+
 /** Read all state files and build the full render context */
 export async function readAllState(cwd: string, config: ResolvedHudConfig = DEFAULT_HUD_CONFIG): Promise<HudRenderContext> {
   const version = readVersion();
   const gitBranch = buildGitBranchLabel(cwd, config);
-  const [metrics, hudNotify, session] = await Promise.all([
+  const [metrics, hudNotify, session, currentSessionId] = await Promise.all([
     readMetrics(cwd),
     readHudNotifyState(cwd),
     readSessionState(cwd),
+    readCurrentSessionId(cwd),
   ]);
-  const canonicalSkillState = await readVisibleSkillActiveState(cwd, session?.session_id);
+  const canonicalSkillState = await readVisibleSkillActiveState(cwd, currentSessionId);
   const canonicalSkills = new Map(
     listActiveSkills(canonicalSkillState).map((entry) => [entry.skill, entry] as const),
   );
@@ -411,10 +443,20 @@ export async function readAllState(cwd: string, config: ResolvedHudConfig = DEFA
   const ultraqa = canonicalSkills.has('ultraqa') || useCompatibilityFallback
     ? mergePhase(ultraqaDetail?.active === true ? ultraqaDetail : null, canonicalPhaseForSkill(canonicalSkills, 'ultraqa'))
     : null;
+  const canonicalTeamPhase = await readCanonicalTeamPhase(cwd, teamDetail?.active === true ? teamDetail : null);
   const team = canonicalSkills.has('team') || useCompatibilityFallback
-    ? mergePhase(teamDetail?.active === true ? teamDetail : null, canonicalPhaseForSkill(canonicalSkills, 'team'))
+    ? mergeTeamPhase(
+      teamDetail?.active === true ? teamDetail : null,
+      canonicalPhaseForSkill(canonicalSkills, 'team'),
+      canonicalTeamPhase,
+    )
     : null;
-  const autoresearch = autoresearchDetail?.active === true ? autoresearchDetail : null;
+  const autoresearch = canonicalSkills.has('autoresearch') || useCompatibilityFallback
+    ? mergePhase(
+      autoresearchDetail?.active === true ? autoresearchDetail : null,
+      canonicalPhaseForSkill(canonicalSkills, 'autoresearch'),
+    )
+    : null;
 
   // When the Rust runtime bridge is enabled, prefer Rust-authored snapshot
   // for authority/backlog/readiness display over JS-inferred state.

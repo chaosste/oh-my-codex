@@ -78,7 +78,7 @@ exit 1
 }
 
 describe('state-server directory initialization', () => {
-  it('creates .omx/state for state tools without setup', async () => {
+  it('keeps read-only state tools side-effect-free without setup', async () => {
     process.env.OMX_STATE_SERVER_DISABLE_AUTO_START = '1';
     const { handleStateToolCall } = await import('../state-server.js');
 
@@ -96,8 +96,8 @@ describe('state-server directory initialization', () => {
         },
       });
 
-      assert.equal(existsSync(stateDir), true);
-      assert.equal(existsSync(tmuxHookConfig), true);
+      assert.equal(existsSync(stateDir), false);
+      assert.equal(existsSync(tmuxHookConfig), false);
       assert.deepEqual(
         JSON.parse(response.content[0]?.text || '{}'),
         { active_modes: [] },
@@ -107,7 +107,65 @@ describe('state-server directory initialization', () => {
     }
   });
 
-  it('bootstraps state-tool tmux-hook from the current tmux pane when available', async () => {
+  it('keeps missing state_read side-effect-free without setup', async () => {
+    process.env.OMX_STATE_SERVER_DISABLE_AUTO_START = '1';
+    const { handleStateToolCall } = await import('../state-server.js');
+
+    const wd = await mkdtemp(join(tmpdir(), 'omx-state-server-read-test-'));
+    try {
+      const stateDir = join(wd, '.omx', 'state');
+      const tmuxHookConfig = join(wd, '.omx', 'tmux-hook.json');
+      assert.equal(existsSync(stateDir), false);
+      assert.equal(existsSync(tmuxHookConfig), false);
+
+      const response = await handleStateToolCall({
+        params: {
+          name: 'state_read',
+          arguments: { workingDirectory: wd, mode: 'deep-interview' },
+        },
+      });
+
+      assert.equal(existsSync(stateDir), false);
+      assert.equal(existsSync(tmuxHookConfig), false);
+      assert.deepEqual(
+        JSON.parse(response.content[0]?.text || '{}'),
+        { exists: false, mode: 'deep-interview' },
+      );
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps state_get_status side-effect-free without setup', async () => {
+    process.env.OMX_STATE_SERVER_DISABLE_AUTO_START = '1';
+    const { handleStateToolCall } = await import('../state-server.js');
+
+    const wd = await mkdtemp(join(tmpdir(), 'omx-state-server-status-test-'));
+    try {
+      const stateDir = join(wd, '.omx', 'state');
+      const tmuxHookConfig = join(wd, '.omx', 'tmux-hook.json');
+      assert.equal(existsSync(stateDir), false);
+      assert.equal(existsSync(tmuxHookConfig), false);
+
+      const response = await handleStateToolCall({
+        params: {
+          name: 'state_get_status',
+          arguments: { workingDirectory: wd },
+        },
+      });
+
+      assert.equal(existsSync(stateDir), false);
+      assert.equal(existsSync(tmuxHookConfig), false);
+      assert.deepEqual(
+        JSON.parse(response.content[0]?.text || '{}'),
+        { statuses: {} },
+      );
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('bootstraps state-tool tmux-hook from the current tmux pane for mutating tools', async () => {
     process.env.OMX_STATE_SERVER_DISABLE_AUTO_START = '1';
     const { handleStateToolCall } = await import('../state-server.js');
 
@@ -125,11 +183,17 @@ describe('state-server directory initialization', () => {
         async () => {
           const response = await handleStateToolCall({
             params: {
-              name: 'state_list_active',
-              arguments: { workingDirectory: wd },
+              name: 'state_write',
+              arguments: {
+                workingDirectory: wd,
+                mode: 'deep-interview',
+                active: true,
+                current_phase: 'deep-interview',
+              },
             },
           });
-          assert.deepEqual(JSON.parse(response.content[0]?.text || '{}'), { active_modes: [] });
+          const payload = JSON.parse(response.content[0]?.text || '{}');
+          assert.equal(payload.success, true);
         },
       );
 
@@ -195,14 +259,95 @@ describe('state-server directory initialization', () => {
     }
   });
 
-  it('creates session-scoped state directory when session_id is provided', async () => {
+  it('accepts canonical lifecycle_outcome and backfills compatibility run_outcome', async () => {
+    process.env.OMX_STATE_SERVER_DISABLE_AUTO_START = '1';
+    const { handleStateToolCall } = await import('../state-server.js');
+
+    const wd = await mkdtemp(join(tmpdir(), 'omx-state-server-lifecycle-'));
+    try {
+      const writeResponse = await handleStateToolCall({
+        params: {
+          name: 'state_write',
+          arguments: {
+            workingDirectory: wd,
+            mode: 'deep-interview',
+            active: false,
+            lifecycle_outcome: 'askuserQuestion',
+            state: {
+              current_focus: 'intent',
+            },
+          },
+        },
+      });
+
+      assert.equal(writeResponse.isError, undefined);
+
+      const readResponse = await handleStateToolCall({
+        params: {
+          name: 'state_read',
+          arguments: {
+            workingDirectory: wd,
+            mode: 'deep-interview',
+          },
+        },
+      });
+
+      const readBody = JSON.parse(readResponse.content[0]?.text || '{}') as Record<string, unknown>;
+      assert.equal(readBody.lifecycle_outcome, 'askuserQuestion');
+      assert.equal(readBody.run_outcome, 'blocked_on_user');
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('derives canonical lifecycle_outcome from legacy run_outcome when needed', async () => {
+    process.env.OMX_STATE_SERVER_DISABLE_AUTO_START = '1';
+    const { handleStateToolCall } = await import('../state-server.js');
+
+    const wd = await mkdtemp(join(tmpdir(), 'omx-state-server-run-outcome-'));
+    try {
+      await handleStateToolCall({
+        params: {
+          name: 'state_write',
+          arguments: {
+            workingDirectory: wd,
+            mode: 'team',
+            active: false,
+            run_outcome: 'cancelled',
+          },
+        },
+      });
+
+      const readResponse = await handleStateToolCall({
+        params: {
+          name: 'state_read',
+          arguments: {
+            workingDirectory: wd,
+            mode: 'team',
+          },
+        },
+      });
+
+      const readBody = JSON.parse(readResponse.content[0]?.text || '{}') as Record<string, unknown>;
+      assert.equal(readBody.lifecycle_outcome, 'userinterlude');
+      assert.equal(readBody.run_outcome, 'cancelled');
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps session-scoped state_get_status side-effect-free when session_id is provided', async () => {
     process.env.OMX_STATE_SERVER_DISABLE_AUTO_START = '1';
     const { handleStateToolCall } = await import('../state-server.js');
 
     const wd = await mkdtemp(join(tmpdir(), 'omx-state-server-test-'));
     try {
+      const stateDir = join(wd, '.omx', 'state');
       const sessionDir = join(wd, '.omx', 'state', 'sessions', 'sess1');
+      const tmuxHookConfig = join(wd, '.omx', 'tmux-hook.json');
+      assert.equal(existsSync(stateDir), false);
       assert.equal(existsSync(sessionDir), false);
+      assert.equal(existsSync(tmuxHookConfig), false);
 
       const response = await handleStateToolCall({
         params: {
@@ -211,11 +356,82 @@ describe('state-server directory initialization', () => {
         },
       });
 
-      assert.equal(existsSync(sessionDir), true);
+      assert.equal(existsSync(stateDir), false);
+      assert.equal(existsSync(sessionDir), false);
+      assert.equal(existsSync(tmuxHookConfig), false);
       assert.deepEqual(
         JSON.parse(response.content[0]?.text || '{}'),
         { statuses: {} },
       );
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('state_write accepts canonical lifecycle_outcome while preserving compatibility run_outcome', async () => {
+    process.env.OMX_STATE_SERVER_DISABLE_AUTO_START = '1';
+    const { handleStateToolCall } = await import('../state-server.js');
+
+    const wd = await mkdtemp(join(tmpdir(), 'omx-state-server-lifecycle-'));
+    try {
+      const response = await handleStateToolCall({
+        params: {
+          name: 'state_write',
+          arguments: {
+            workingDirectory: wd,
+            mode: 'autopilot',
+            active: false,
+            current_phase: 'waiting-for-user-answer',
+            lifecycle_outcome: 'askuserQuestion',
+          },
+        },
+      });
+
+      assert.equal(response.isError, undefined);
+      const state = JSON.parse(await readFile(join(wd, '.omx', 'state', 'autopilot-state.json'), 'utf-8')) as {
+        active?: boolean;
+        lifecycle_outcome?: string;
+        terminal_outcome?: string;
+        run_outcome?: string;
+        completed_at?: string;
+      };
+      assert.equal(state.active, false);
+      assert.equal(state.lifecycle_outcome, 'askuserQuestion');
+      assert.equal(state.terminal_outcome, undefined);
+      assert.equal(state.run_outcome, 'blocked_on_user');
+      assert.ok(state.completed_at);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('state_write lets canonical lifecycle_outcome take precedence over legacy run_outcome', async () => {
+    process.env.OMX_STATE_SERVER_DISABLE_AUTO_START = '1';
+    const { handleStateToolCall } = await import('../state-server.js');
+
+    const wd = await mkdtemp(join(tmpdir(), 'omx-state-server-lifecycle-precedence-'));
+    try {
+      const response = await handleStateToolCall({
+        params: {
+          name: 'state_write',
+          arguments: {
+            workingDirectory: wd,
+            mode: 'autopilot',
+            active: false,
+            current_phase: 'user-stopped',
+            run_outcome: 'failed',
+            lifecycle_outcome: 'userinterlude',
+          },
+        },
+      });
+
+      assert.equal(response.isError, undefined);
+      const state = JSON.parse(await readFile(join(wd, '.omx', 'state', 'autopilot-state.json'), 'utf-8')) as {
+        lifecycle_outcome?: string;
+        run_outcome?: string;
+      };
+      assert.equal(state.lifecycle_outcome, 'userinterlude');
+      assert.equal(state.run_outcome, 'cancelled');
     } finally {
       await rm(wd, { recursive: true, force: true });
     }
@@ -304,6 +520,70 @@ describe('state-server directory initialization', () => {
       };
       assert.equal(clearedCanonical.active, false);
       assert.deepEqual(clearedCanonical.active_skills, []);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('writes a session-scoped inactive tombstone when clearing a mode under an active session', async () => {
+    process.env.OMX_STATE_SERVER_DISABLE_AUTO_START = '1';
+    const { handleStateToolCall } = await import('../state-server.js');
+
+    const wd = await mkdtemp(join(tmpdir(), 'omx-state-server-clear-root-fallback-'));
+    try {
+      const stateDir = join(wd, '.omx', 'state');
+      const sessionId = 'sess-clear';
+      const sessionDir = join(stateDir, 'sessions', sessionId);
+      await mkdir(sessionDir, { recursive: true });
+      await writeFile(join(stateDir, 'session.json'), JSON.stringify({ session_id: sessionId }, null, 2));
+      await writeFile(
+        join(stateDir, 'deep-interview-state.json'),
+        JSON.stringify({ active: true, mode: 'deep-interview', current_phase: 'legacy-root' }, null, 2),
+      );
+      await writeFile(
+        join(sessionDir, 'deep-interview-state.json'),
+        JSON.stringify({ active: true, mode: 'deep-interview', current_phase: 'session-active' }, null, 2),
+      );
+
+      await handleStateToolCall({
+        params: {
+          name: 'state_clear',
+          arguments: {
+            workingDirectory: wd,
+            mode: 'deep-interview',
+          },
+        },
+      });
+
+      const sessionState = JSON.parse(
+        await readFile(join(sessionDir, 'deep-interview-state.json'), 'utf-8'),
+      ) as Record<string, unknown>;
+      assert.equal(sessionState.active, false);
+      assert.equal(sessionState.current_phase, 'cleared');
+      assert.equal(sessionState.session_id, sessionId);
+
+      const listResponse = await handleStateToolCall({
+        params: {
+          name: 'state_list_active',
+          arguments: {
+            workingDirectory: wd,
+          },
+        },
+      });
+      assert.deepEqual(JSON.parse(listResponse.content[0]?.text || '{}'), { active_modes: [] });
+
+      const readResponse = await handleStateToolCall({
+        params: {
+          name: 'state_read',
+          arguments: {
+            workingDirectory: wd,
+            mode: 'deep-interview',
+          },
+        },
+      });
+      const readBody = JSON.parse(readResponse.content[0]?.text || '{}') as Record<string, unknown>;
+      assert.equal(readBody.active, false);
+      assert.equal(readBody.current_phase, 'cleared');
     } finally {
       await rm(wd, { recursive: true, force: true });
     }
@@ -399,7 +679,7 @@ describe('state-server directory initialization', () => {
             session_id: 'sess-deny',
             mode: 'autopilot',
             active: true,
-            current_phase: 'planning',
+            current_phase: 'ralplan',
           },
         },
       });
@@ -727,10 +1007,17 @@ describe('state-server directory initialization', () => {
 
       const completed = JSON.parse(
         await readFile(join(wd, '.omx', 'state', 'sessions', 'sess-handoff', 'deep-interview-state.json'), 'utf-8'),
-      ) as { active?: boolean; current_phase?: string; completed_at?: string; auto_completed_reason?: string };
+      ) as {
+        active?: boolean;
+        current_phase?: string;
+        completed_at?: string;
+        auto_completed_reason?: string;
+        run_outcome?: string;
+      };
       assert.equal(completed.active, false);
       assert.equal(completed.current_phase, 'completed');
       assert.equal(typeof completed.completed_at, 'string');
+      assert.equal(completed.run_outcome, 'finish');
       assert.match(completed.auto_completed_reason || '', /mode transiting: deep-interview -> ralplan/);
     } finally {
       await rm(wd, { recursive: true, force: true });
@@ -749,9 +1036,9 @@ describe('state-server directory initialization', () => {
           arguments: {
             workingDirectory: wd,
             session_id: 'sess-rollback',
-            mode: 'autopilot',
+            mode: 'ralph',
             active: true,
-            current_phase: 'planning',
+            current_phase: 'executing',
           },
         },
       });
@@ -773,6 +1060,46 @@ describe('state-server directory initialization', () => {
       const body = JSON.parse(denied.content[0]?.text || '{}') as { error?: string };
       assert.match(body.error || '', /Execution-to-planning rollback auto-complete is not allowed/i);
       assert.match(body.error || '', /First clear current state first and retry if this action is intended/i);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('does not auto-complete existing workflow state when tracked write validation fails', async () => {
+    process.env.OMX_STATE_SERVER_DISABLE_AUTO_START = '1';
+    const { handleStateToolCall } = await import('../state-server.js');
+
+    const wd = await mkdtemp(join(tmpdir(), 'omx-state-server-validate-before-transition-'));
+    try {
+      await mkdir(join(wd, '.omx', 'state', 'sessions', 'sess-invalid'), { recursive: true });
+      await writeFile(
+        join(wd, '.omx', 'state', 'sessions', 'sess-invalid', 'ralplan-state.json'),
+        JSON.stringify({ active: true, mode: 'ralplan', current_phase: 'planning' }, null, 2),
+      );
+
+      const denied = await handleStateToolCall({
+        params: {
+          name: 'state_write',
+          arguments: {
+            workingDirectory: wd,
+            session_id: 'sess-invalid',
+            mode: 'ralph',
+            active: true,
+            current_phase: 'definitely-invalid',
+          },
+        },
+      });
+
+      assert.equal(denied.isError, true);
+      const body = JSON.parse(denied.content[0]?.text || '{}') as { error?: string };
+      assert.match(body.error || '', /ralph\.current_phase/i);
+
+      const ralplanState = JSON.parse(
+        await readFile(join(wd, '.omx', 'state', 'sessions', 'sess-invalid', 'ralplan-state.json'), 'utf-8'),
+      ) as Record<string, unknown>;
+      assert.equal(ralplanState.active, true);
+      assert.equal(ralplanState.current_phase, 'planning');
+      assert.equal(existsSync(join(wd, '.omx', 'state', 'sessions', 'sess-invalid', 'ralph-state.json')), false);
     } finally {
       await rm(wd, { recursive: true, force: true });
     }

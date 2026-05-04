@@ -16,6 +16,8 @@ import {
   readVisibleSkillActiveState,
   syncCanonicalSkillStateForMode,
 } from './skill-active.js';
+import { applyRunOutcomeContract } from '../runtime/run-outcome.js';
+import { clearDeepInterviewQuestionObligation } from '../question/deep-interview.js';
 
 interface TransitionStateLike {
   active?: unknown;
@@ -45,7 +47,7 @@ async function readJsonIfExists(
   } catch {
     if (options?.throwOnParseError && options.mode) {
       throw new Error(
-        `Cannot read ${options.mode} workflow state at ${path}. Clear or repair state via \`omx state clear --mode ${options.mode}\` or the \`omx_state.*\` MCP tools.`,
+        `Cannot read ${options.mode} workflow state at ${path}. Repair or clear that workflow state yourself via \`omx state clear --mode ${options.mode}\` or the \`omx_state.*\` MCP tools.`,
       );
     }
     return null;
@@ -95,7 +97,7 @@ async function completeSourceModeState(
     const existing = await readJsonIfExists(candidatePath);
     if (!existing || existing.active !== true) continue;
 
-    const nextState: TransitionStateLike = {
+    const nextCandidate: TransitionStateLike = {
       ...existing,
       active: false,
       current_phase: 'completed',
@@ -105,6 +107,20 @@ async function completeSourceModeState(
       transition_source: source,
       transition_target_mode: destinationMode,
     };
+    if (sourceMode === 'deep-interview') {
+      const nextQuestionEnforcement = clearDeepInterviewQuestionObligation(
+        existing.question_enforcement as Parameters<typeof clearDeepInterviewQuestionObligation>[0],
+        'handoff',
+        new Date(nowIso),
+      );
+      if (nextQuestionEnforcement) {
+        nextCandidate.question_enforcement = nextQuestionEnforcement;
+      } else {
+        delete nextCandidate.question_enforcement;
+      }
+    }
+    delete nextCandidate.run_outcome;
+    const nextState = applyRunOutcomeContract(nextCandidate, { nowIso }).state as TransitionStateLike;
 
     await mkdir(dirname(candidatePath), { recursive: true });
     await writeFile(candidatePath, JSON.stringify(nextState, null, 2));

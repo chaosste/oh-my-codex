@@ -1,6 +1,6 @@
 import { join } from "path";
 
-const MANAGED_HOOK_EVENTS = [
+export const MANAGED_HOOK_EVENTS = [
   "SessionStart",
   "PreToolUse",
   "PostToolUse",
@@ -66,24 +66,18 @@ export function buildManagedCodexHooksConfig(
       SessionStart: [
         buildCommandHook(command, {
           matcher: "startup|resume",
-          statusMessage: "Loading OMX session context",
         }),
       ],
       PreToolUse: [
         buildCommandHook(command, {
           matcher: "Bash",
-          statusMessage: "Running OMX Bash preflight",
         }),
       ],
       PostToolUse: [
-        buildCommandHook(command, {
-          statusMessage: "Running OMX tool review",
-        }),
+        buildCommandHook(command),
       ],
       UserPromptSubmit: [
-        buildCommandHook(command, {
-          statusMessage: "Applying OMX prompt routing",
-        }),
+        buildCommandHook(command),
       ],
       Stop: [
         buildCommandHook(command, {
@@ -112,6 +106,33 @@ export function parseCodexHooksConfig(
 
 function isOmxManagedHookCommand(command: string): boolean {
   return /(?:^|[\\/])codex-native-hook\.js(?:["'\s]|$)/.test(command);
+}
+
+function countManagedHooksInEntry(entry: unknown): number {
+  if (!isPlainObject(entry) || !Array.isArray(entry.hooks)) {
+    return 0;
+  }
+
+  return entry.hooks.filter((hook) => {
+    return isPlainObject(hook)
+      && hook.type === "command"
+      && typeof hook.command === "string"
+      && isOmxManagedHookCommand(hook.command);
+  }).length;
+}
+
+export function getMissingManagedCodexHookEvents(
+  content: string,
+): ManagedHookEventName[] | null {
+  const parsed = parseCodexHooksConfig(content);
+  if (!parsed) return null;
+
+  return MANAGED_HOOK_EVENTS.filter((eventName) => {
+    const entries = Array.isArray(parsed.hooks[eventName])
+      ? parsed.hooks[eventName]
+      : [];
+    return !entries.some((entry) => countManagedHooksInEntry(entry) > 0);
+  });
 }
 
 function stripManagedHooksFromEntry(entry: unknown): {

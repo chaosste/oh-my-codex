@@ -1,5 +1,6 @@
 import { execFileSync } from 'child_process';
 import { HUD_TMUX_HEIGHT_LINES } from './constants.js';
+import { resolveTmuxBinaryForPlatform } from '../utils/platform-command.js';
 
 export interface TmuxPaneSnapshot {
   paneId: string;
@@ -10,7 +11,10 @@ export interface TmuxPaneSnapshot {
 type TmuxExecSync = (args: string[]) => string;
 
 function defaultExecTmuxSync(args: string[]): string {
-  return execFileSync('tmux', args, { encoding: 'utf-8' });
+  return execFileSync(resolveTmuxBinaryForPlatform() || 'tmux', args, {
+    encoding: 'utf-8',
+    ...(process.platform === 'win32' ? { windowsHide: true } : {}),
+  });
 }
 
 export function parseTmuxPaneSnapshot(output: string): TmuxPaneSnapshot[] {
@@ -57,20 +61,24 @@ export function shellEscapeSingle(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
-export function buildHudWatchCommand(omxBin: string, preset?: string): string {
+export function buildHudWatchCommand(omxBin: string, preset?: string, sessionId?: string): string {
   const safePreset = preset === 'minimal' || preset === 'focused' || preset === 'full'
     ? ` --preset=${preset}`
     : '';
-  return `node ${shellEscapeSingle(omxBin)} hud --watch${safePreset}`;
+  const safeSessionId = typeof sessionId === 'string' ? sessionId.trim() : '';
+  const sessionPrefix = safeSessionId ? `OMX_SESSION_ID=${shellEscapeSingle(safeSessionId)} ` : '';
+  return `${sessionPrefix}node ${shellEscapeSingle(omxBin)} hud --watch${safePreset}`;
 }
 
 export function listCurrentWindowPanes(
   execTmuxSync: TmuxExecSync = defaultExecTmuxSync,
+  currentPaneId?: string,
 ): TmuxPaneSnapshot[] {
   try {
     return parseTmuxPaneSnapshot(
       execTmuxSync([
         'list-panes',
+        ...(currentPaneId ? ['-t', currentPaneId] : []),
         '-F',
         '#{pane_id}\t#{pane_current_command}\t#{pane_start_command}',
       ]),
@@ -84,14 +92,20 @@ export function listCurrentWindowHudPaneIds(
   currentPaneId?: string,
   execTmuxSync: TmuxExecSync = defaultExecTmuxSync,
 ): string[] {
-  return findHudWatchPaneIds(listCurrentWindowPanes(execTmuxSync), currentPaneId);
+  return findHudWatchPaneIds(listCurrentWindowPanes(execTmuxSync, currentPaneId), currentPaneId);
 }
 
 export function readCurrentWindowSize(
   execTmuxSync: TmuxExecSync = defaultExecTmuxSync,
+  currentPaneId?: string,
 ): { width: number | null; height: number | null } {
   try {
-    const raw = execTmuxSync(['display-message', '-p', '#{window_width}\t#{window_height}']);
+    const raw = execTmuxSync([
+      'display-message',
+      '-p',
+      ...(currentPaneId ? ['-t', currentPaneId] : []),
+      '#{window_width}\t#{window_height}',
+    ]);
     const [widthRaw = '', heightRaw = ''] = raw.split('\t');
     const width = Number.parseInt(widthRaw.trim(), 10);
     const height = Number.parseInt(heightRaw.trim(), 10);
@@ -110,6 +124,7 @@ export function createHudWatchPane(
   options: {
     heightLines?: number;
     fullWidth?: boolean;
+    targetPaneId?: string;
   } = {},
   execTmuxSync: TmuxExecSync = defaultExecTmuxSync,
 ): string | null {
@@ -123,6 +138,7 @@ export function createHudWatchPane(
     '-l',
     String(heightLines),
     '-d',
+    ...(options.targetPaneId ? ['-t', options.targetPaneId] : []),
     '-c',
     cwd,
     '-P',

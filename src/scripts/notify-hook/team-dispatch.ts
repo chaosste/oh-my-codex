@@ -1,6 +1,6 @@
 // @ts-nocheck
 import { appendFile, mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'fs/promises';
-import { existsSync } from 'fs';
+import { appendFileSync, existsSync, mkdirSync } from 'fs';
 import { execFileSync } from 'child_process';
 import { dirname, join, resolve } from 'path';
 import { fileURLToPath } from 'node:url';
@@ -27,7 +27,7 @@ import {
  * owned path.
  * Disable entirely with OMX_RUNTIME_BRIDGE=0.
  */
-function runtimeExec(command, stateDir) {
+function runtimeExec(command, stateDir, team) {
   if (process.env.OMX_RUNTIME_BRIDGE === '0') return;
   try {
     const binaryPath = resolveRuntimeBinaryPath();
@@ -36,8 +36,79 @@ function runtimeExec(command, stateDir) {
       stdio: ['pipe', 'pipe', 'pipe'],
       windowsHide: true,
     });
-  } catch {
+  } catch (error) {
+    recordBridgeFallback({
+      stateDir,
+      team,
+      operation: 'runtimeExec',
+      fallbackTarget: 'js_state_mutation',
+      command: safeString(command?.command).trim() || 'unknown',
+      requestId: safeString(command?.request_id).trim() || undefined,
+      messageId: safeString(command?.message_id).trim() || undefined,
+      reason: bridgeErrorReason(error),
+    });
     // non-fatal: JS path is the fallback
+  }
+}
+
+function bridgeErrorReason(error) {
+  const err = error || {};
+  const stderr = safeString(err.stderr).trim();
+  if (stderr) return stderr.slice(0, 500);
+  const message = safeString(err.message).trim();
+  if (message) return message.slice(0, 500);
+  return 'unknown_bridge_error';
+}
+
+function bridgeFallbackLogPath(stateDir) {
+  return join(dirname(stateDir), 'logs', `team-dispatch-${new Date().toISOString().slice(0, 10)}.jsonl`);
+}
+
+function recordBridgeFallback({
+  stateDir,
+  team,
+  operation,
+  fallbackTarget,
+  command,
+  requestId,
+  messageId,
+  reason,
+}) {
+  const event = {
+    timestamp: new Date().toISOString(),
+    type: 'bridge_fallback',
+    source: 'notify-hook.team-dispatch',
+    fallback: true,
+    counter: 'team_dispatch_bridge_fallback_total',
+    bridge_operation: operation,
+    fallback_target: fallbackTarget,
+    team: safeString(team).trim() || null,
+    command: safeString(command).trim() || null,
+    request_id: safeString(requestId).trim() || null,
+    message_id: safeString(messageId).trim() || null,
+    reason: safeString(reason).trim() || 'unknown_bridge_fallback',
+  };
+  try {
+    const logPath = bridgeFallbackLogPath(stateDir);
+    mkdirSync(dirname(logPath), { recursive: true });
+    appendFileSync(logPath, `${JSON.stringify(event)}\n`);
+  } catch {
+    // best effort observability only
+  }
+  try {
+    appendTeamDeliveryLog(join(dirname(stateDir), 'logs'), {
+      event: 'bridge_fallback',
+      ...event,
+    }).catch(() => {});
+  } catch {
+    // best effort observability only
+  }
+  try {
+    process.emitWarning(`[omx] team-dispatch bridge fallback: ${event.bridge_operation} -> ${event.fallback_target}: ${event.reason}`, {
+      code: 'OMX_TEAM_DISPATCH_BRIDGE_FALLBACK',
+    });
+  } catch {
+    // best effort observability only
   }
 }
 
@@ -50,8 +121,29 @@ function readJson(path, fallback) {
 async function readBridgeDispatchRequests(stateDir, teamName) {
   const candidate = join(stateDir, 'dispatch.json');
   if (!existsSync(candidate)) return null;
-  const parsed = await readJson(candidate, null);
-  if (!parsed || !Array.isArray(parsed.records)) return null;
+  let parsed;
+  try {
+    parsed = JSON.parse(await readFile(candidate, 'utf8'));
+  } catch (error) {
+    recordBridgeFallback({
+      stateDir,
+      team: teamName,
+      operation: 'readBridgeDispatchRequests',
+      fallbackTarget: 'legacy_dispatch_requests',
+      reason: `parse_failed:${bridgeErrorReason(error)}`,
+    });
+    return null;
+  }
+  if (!parsed || !Array.isArray(parsed.records)) {
+    recordBridgeFallback({
+      stateDir,
+      team: teamName,
+      operation: 'readBridgeDispatchRequests',
+      fallbackTarget: 'legacy_dispatch_requests',
+      reason: 'invalid_dispatch_compat_schema',
+    });
+    return null;
+  }
   return parsed.records
     .map((record) => {
       if (!record || typeof record !== 'object') return null;
@@ -97,6 +189,7 @@ async function writeJsonAtomic(path, value) {
 
 // Keep stale-timeout semantics aligned with src/team/state.ts LOCK_STALE_MS.
 const DISPATCH_LOCK_STALE_MS = 5 * 60 * 1000;
+const DISPATCH_REQUEST_LEASE_STALE_MS = 30 * 1000;
 const DEFAULT_ISSUE_DISPATCH_COOLDOWN_MS = 15 * 60 * 1000;
 const ISSUE_DISPATCH_COOLDOWN_ENV = 'OMX_TEAM_DISPATCH_ISSUE_COOLDOWN_MS';
 const DEFAULT_DISPATCH_TRIGGER_COOLDOWN_MS = 30 * 1000;
@@ -117,6 +210,15 @@ async function emitOperationalHookEvent(cwd, eventName, context) {
   } catch {
     // best effort only
   }
+}
+
+function mapDispatchFailureToCanonicalEvent(reason) {
+  const normalized = safeString(reason).toLowerCase();
+  if (!normalized) return 'run.blocked_on_system';
+  if (normalized.includes('missing') || normalized.includes('deferred') || normalized.includes('rejected')) {
+    return 'run.blocked_on_user';
+  }
+  return 'run.blocked_on_system';
 }
 
 function resolveIssueDispatchCooldownMs(env = process.env) {
@@ -183,6 +285,31 @@ function parseTriggerCooldownEntry(entry) {
   };
 }
 
+function reserveDispatchCooldowns({
+  issueCooldownMs,
+  triggerCooldownMs,
+  issueCooldownByIssue,
+  triggerCooldownByKey,
+  issueKey,
+  triggerKey,
+  requestId,
+  reservedAt = Date.now(),
+}) {
+  let mutated = false;
+  if (issueKey && issueCooldownMs > 0) {
+    issueCooldownByIssue[issueKey] = reservedAt;
+    mutated = true;
+  }
+  if (triggerKey && triggerCooldownMs > 0) {
+    triggerCooldownByKey[triggerKey] = {
+      at: reservedAt,
+      last_request_id: safeString(requestId).trim(),
+    };
+    mutated = true;
+  }
+  return mutated;
+}
+
 async function withLockDirectory(lockDir, timeoutError, fn) {
   const ownerPath = join(lockDir, 'owner');
   const ownerToken = `${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}`;
@@ -243,6 +370,49 @@ async function withMailboxLock(teamDirPath, workerName, fn) {
     `Timed out acquiring mailbox lock for ${teamDirPath}/${workerName}`,
     fn,
   );
+}
+
+function dispatchRequestLeaseDir(teamDirPath, requestId) {
+  return join(teamDirPath, 'dispatch', `.processing-${safeString(requestId).trim()}`);
+}
+
+async function tryAcquireDispatchRequestLease(teamDirPath, requestId) {
+  const lockDir = dispatchRequestLeaseDir(teamDirPath, requestId);
+  const ownerPath = join(lockDir, 'owner');
+  const ownerToken = `${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}`;
+  await mkdir(dirname(lockDir), { recursive: true });
+
+  while (true) {
+    try {
+      await mkdir(lockDir, { recursive: false });
+      await writeFile(ownerPath, ownerToken, 'utf8');
+      return { lockDir, ownerPath, ownerToken, requestId };
+    } catch (error) {
+      if (error?.code !== 'EEXIST') throw error;
+      try {
+        const info = await stat(lockDir);
+        if (Date.now() - info.mtimeMs > DISPATCH_REQUEST_LEASE_STALE_MS) {
+          await rm(lockDir, { recursive: true, force: true });
+          continue;
+        }
+      } catch {
+        // best effort
+      }
+      return null;
+    }
+  }
+}
+
+async function releaseDispatchRequestLease(lease) {
+  if (!lease?.lockDir || !lease?.ownerPath || !lease?.ownerToken) return;
+  try {
+    const currentOwner = await readFile(lease.ownerPath, 'utf8');
+    if (currentOwner.trim() === lease.ownerToken) {
+      await rm(lease.lockDir, { recursive: true, force: true });
+    }
+  } catch {
+    // best effort
+  }
 }
 
 function resolveLeaderPaneId(config) {
@@ -334,6 +504,213 @@ async function appendLeaderNotificationDeferredEvent({
   };
   await mkdir(eventsDir, { recursive: true }).catch(() => {});
   await appendFile(eventsPath, JSON.stringify(event) + '\n').catch(() => {});
+}
+
+async function finalizeClaimedDispatchRequest({
+  claim,
+  result,
+  teamName,
+  teamDirPath,
+  config,
+  cwd,
+  stateDir,
+  logsDir,
+  issueCooldownMs,
+  triggerCooldownMs,
+}) {
+  const requestsPath = join(teamDirPath, 'dispatch', 'requests.json');
+  const issueKey = extractIssueKey(claim.request.trigger_message);
+  const triggerKey = normalizeTriggerKey(claim.request.trigger_message);
+  let summary = { processed: 0, skipped: 0, failed: 0 };
+
+  await withDispatchLock(teamDirPath, async () => {
+    const bridgeRequests = await readBridgeDispatchRequests(stateDir, teamName);
+    const usingLegacyRequests = bridgeRequests === null;
+    const requests = usingLegacyRequests ? await readJson(requestsPath, []) : bridgeRequests;
+    if (!Array.isArray(requests)) return;
+
+    const index = requests.findIndex((entry) => safeString(entry?.request_id).trim() === claim.request.request_id);
+    if (index < 0) return;
+
+    const request = requests[index];
+    if (!request || typeof request !== 'object' || shouldSkipRequest(request) || request.status !== 'pending') return;
+
+    const issueCooldownState = await readIssueCooldownState(teamDirPath);
+    const triggerCooldownState = await readTriggerCooldownState(teamDirPath);
+    const issueCooldownByIssue = issueCooldownState.by_issue || {};
+    const triggerCooldownByKey = triggerCooldownState.by_trigger || {};
+    const nowIso = new Date().toISOString();
+    let mutated = false;
+
+    mutated = reserveDispatchCooldowns({
+      issueCooldownMs,
+      triggerCooldownMs,
+      issueCooldownByIssue,
+      triggerCooldownByKey,
+      issueKey,
+      triggerKey,
+      requestId: request.request_id,
+    }) || mutated;
+
+    request.attempt_count = Number.isFinite(request.attempt_count) ? Math.max(0, request.attempt_count + 1) : 1;
+    request.updated_at = nowIso;
+
+    if (result.ok) {
+      const MAX_UNCONFIRMED_ATTEMPTS = 3;
+      if (result.reason === 'tmux_send_keys_unconfirmed' && request.attempt_count < MAX_UNCONFIRMED_ATTEMPTS) {
+        request.last_reason = result.reason;
+        summary.skipped += 1;
+        mutated = true;
+        await appendDispatchLog(logsDir, {
+          type: 'dispatch_unconfirmed_retry',
+          team: teamName,
+          request_id: request.request_id,
+          worker: request.to_worker,
+          attempt: request.attempt_count,
+          reason: result.reason,
+          ...buildDispatchAttemptEvidence(result),
+        });
+        await appendDeliveryTelemetry(logsDir, {
+          event: 'dispatch_result',
+          team: teamName,
+          request_id: request.request_id,
+          message_id: request.message_id || null,
+          to_worker: request.to_worker,
+          transport: 'send-keys',
+          result: 'retry',
+          reason: result.reason,
+        });
+        await emitOperationalHookEvent(cwd, 'retry-needed', {
+          team: teamName,
+          worker: request.to_worker,
+          request_id: request.request_id,
+          attempt: request.attempt_count,
+          command: request.trigger_message,
+          reason: result.reason,
+          status: 'retry-needed',
+        });
+      } else if (result.reason === 'tmux_send_keys_unconfirmed') {
+        request.status = 'failed';
+        request.failed_at = nowIso;
+        request.last_reason = 'unconfirmed_after_max_retries';
+        runtimeExec({ command: 'MarkFailed', request_id: request.request_id, reason: 'unconfirmed_after_max_retries' }, stateDir, teamName);
+        summary.processed += 1;
+        summary.failed += 1;
+        mutated = true;
+        await appendDispatchLog(logsDir, {
+          type: 'dispatch_failed',
+          team: teamName,
+          request_id: request.request_id,
+          worker: request.to_worker,
+          message_id: request.message_id || null,
+          reason: request.last_reason,
+          ...buildDispatchAttemptEvidence(result),
+        });
+        await appendDeliveryTelemetry(logsDir, {
+          event: 'dispatch_result',
+          team: teamName,
+          request_id: request.request_id,
+          message_id: request.message_id || null,
+          to_worker: request.to_worker,
+          transport: 'send-keys',
+          result: 'failed',
+          reason: request.last_reason,
+        });
+        await emitOperationalHookEvent(cwd, 'failed', {
+          team: teamName,
+          worker: request.to_worker,
+          request_id: request.request_id,
+          message_id: request.message_id || null,
+          command: request.trigger_message,
+          reason: request.last_reason,
+          error_summary: request.last_reason,
+          status: 'failed',
+        });
+      } else {
+        request.status = 'notified';
+        request.notified_at = nowIso;
+        request.last_reason = result.reason;
+        runtimeExec({ command: 'MarkNotified', request_id: request.request_id, channel: 'tmux' }, stateDir, teamName);
+        if (request.kind === 'mailbox' && request.message_id) {
+          runtimeExec({ command: 'MarkMailboxNotified', message_id: request.message_id }, stateDir, teamName);
+          if (usingLegacyRequests) {
+            await updateMailboxNotified(stateDir, teamName, request.to_worker, request.message_id).catch(() => {});
+          }
+        }
+        summary.processed += 1;
+        mutated = true;
+        await appendDispatchLog(logsDir, {
+          type: 'dispatch_notified',
+          team: teamName,
+          request_id: request.request_id,
+          worker: request.to_worker,
+          message_id: request.message_id || null,
+          reason: result.reason,
+          ...buildDispatchAttemptEvidence(result),
+        });
+        await appendDeliveryTelemetry(logsDir, {
+          event: 'dispatch_result',
+          team: teamName,
+          request_id: request.request_id,
+          message_id: request.message_id || null,
+          to_worker: request.to_worker,
+          transport: 'send-keys',
+          result: 'notified',
+          reason: result.reason,
+        });
+      }
+    } else {
+      request.status = 'failed';
+      request.failed_at = nowIso;
+      request.last_reason = result.reason;
+      runtimeExec({ command: 'MarkFailed', request_id: request.request_id, reason: result.reason }, stateDir, teamName);
+      summary.processed += 1;
+      summary.failed += 1;
+      mutated = true;
+      await appendDispatchLog(logsDir, {
+        type: 'dispatch_failed',
+        team: teamName,
+        request_id: request.request_id,
+        worker: request.to_worker,
+        message_id: request.message_id || null,
+        reason: result.reason,
+        ...buildDispatchAttemptEvidence(result),
+      });
+      await appendDeliveryTelemetry(logsDir, {
+        event: 'dispatch_result',
+        team: teamName,
+        request_id: request.request_id,
+        message_id: request.message_id || null,
+        to_worker: request.to_worker,
+        transport: 'send-keys',
+        result: 'failed',
+        reason: result.reason,
+      });
+      await emitOperationalHookEvent(cwd, result.reason === LEADER_PANE_MISSING_DEFERRED_REASON ? 'handoff-needed' : 'failed', {
+        team: teamName,
+        worker: request.to_worker,
+        request_id: request.request_id,
+        message_id: request.message_id || null,
+        command: request.trigger_message,
+        reason: result.reason,
+        ...(result.reason === LEADER_PANE_MISSING_DEFERRED_REASON
+          ? { status: 'handoff-needed' }
+          : { status: 'failed', error_summary: result.reason }),
+      });
+    }
+
+    if (!mutated) return;
+    issueCooldownState.by_issue = issueCooldownByIssue;
+    await writeJsonAtomic(issueCooldownStatePath(teamDirPath), issueCooldownState);
+    triggerCooldownState.by_trigger = triggerCooldownByKey;
+    await writeJsonAtomic(triggerCooldownStatePath(teamDirPath), triggerCooldownState);
+    await writeJsonAtomic(requestsPath, requests);
+    if (!usingLegacyRequests) {
+      await writeBridgeDispatchCompat(stateDir, teamName, requests);
+    }
+  });
+
+  return summary;
 }
 
 function resolveWorkerCliForRequest(request, config) {
@@ -467,7 +844,7 @@ async function injectDispatchRequest(request, config, cwd, stateDir) {
       const wideCap = await runProcess('tmux', verifyWideArgv, 2000);
       // Worker is actively processing (mirrors sync path tmux-session.ts:1292-1294)
       if (paneHasActiveTask(wideCap.stdout)) {
-        runtimeExec({ command: 'MarkDelivered', request_id: request.request_id }, stateDir);
+        runtimeExec({ command: 'MarkDelivered', request_id: request.request_id }, stateDir, request.team_name);
         return {
           ok: true,
           reason: 'tmux_send_keys_confirmed_active_task',
@@ -488,7 +865,7 @@ async function injectDispatchRequest(request, config, cwd, stateDir) {
       const triggerInNarrow = capturedPaneContainsTrigger(narrowCap.stdout, request.trigger_message);
       const triggerNearTail = capturedPaneContainsTriggerNearTail(wideCap.stdout, request.trigger_message);
       if (!triggerInNarrow && !triggerNearTail) {
-        runtimeExec({ command: 'MarkDelivered', request_id: request.request_id }, stateDir);
+        runtimeExec({ command: 'MarkDelivered', request_id: request.request_id }, stateDir, request.team_name);
         return {
           ok: true,
           reason: 'tmux_send_keys_confirmed',
@@ -602,8 +979,8 @@ export async function drainPendingTeamDispatch({
     const manifestPath = join(teamDirPath, 'manifest.v2.json');
     const configPath = join(teamDirPath, 'config.json');
     const requestsPath = join(teamDirPath, 'dispatch', 'requests.json');
-
     const config = await readJson(existsSync(manifestPath) ? manifestPath : configPath, {});
+    const claims = [];
     await withDispatchLock(teamDirPath, async () => {
       const bridgeRequests = await readBridgeDispatchRequests(stateDir, teamName);
       const usingLegacyRequests = bridgeRequests === null;
@@ -617,7 +994,7 @@ export async function drainPendingTeamDispatch({
 
       let mutated = false;
       for (const request of requests) {
-        if (processed >= maxPerTick) break;
+        if (processed + claims.length >= maxPerTick) break;
         if (!request || typeof request !== 'object') continue;
         if (shouldSkipRequest(request)) {
           skipped += 1;
@@ -660,9 +1037,6 @@ export async function drainPendingTeamDispatch({
               result: 'deferred',
               reason: LEADER_PANE_MISSING_DEFERRED_REASON,
             });
-            // On the legacy fallback lane, requests.json still carries the queue
-            // state for this deferred request; this event stays a progress
-            // artifact for hook/watcher readers.
             await appendLeaderNotificationDeferredEvent({
               stateDir,
               teamName,
@@ -697,170 +1071,24 @@ export async function drainPendingTeamDispatch({
           }
         }
 
-        const result = await injector(request, config, resolve(cwd), stateDir);
-        if (issueKey && issueCooldownMs > 0) {
-          issueCooldownByIssue[issueKey] = Date.now();
-          mutated = true;
+        const lease = await tryAcquireDispatchRequestLease(teamDirPath, request.request_id);
+        if (!lease) {
+          skipped += 1;
+          continue;
         }
-        if (triggerKey && triggerCooldownMs > 0) {
-          triggerCooldownByKey[triggerKey] = {
-            at: Date.now(),
-            last_request_id: safeString(request.request_id).trim(),
-          };
-          mutated = true;
-        }
-        const nowIso = new Date().toISOString();
-        request.attempt_count = Number.isFinite(request.attempt_count) ? Math.max(0, request.attempt_count + 1) : 1;
-        request.updated_at = nowIso;
-
-        if (result.ok) {
-          // Unconfirmed sends: trigger text was still visible after retry
-          // rounds. Leave as pending for the next tick to retry (up to 3
-          // total attempts) rather than marking notified. Fixes #391.
-          const MAX_UNCONFIRMED_ATTEMPTS = 3;
-          if (result.reason === 'tmux_send_keys_unconfirmed' && request.attempt_count < MAX_UNCONFIRMED_ATTEMPTS) {
-            request.last_reason = result.reason;
-            mutated = true;
-            skipped += 1;
-            await appendDispatchLog(logsDir, {
-              type: 'dispatch_unconfirmed_retry',
-              team: teamName,
-              request_id: request.request_id,
-              worker: request.to_worker,
-              attempt: request.attempt_count,
-              reason: result.reason,
-              ...buildDispatchAttemptEvidence(result),
-            });
-            await appendDeliveryTelemetry(logsDir, {
-              event: 'dispatch_result',
-              team: teamName,
-              request_id: request.request_id,
-              message_id: request.message_id || null,
-              to_worker: request.to_worker,
-              transport: 'send-keys',
-              result: 'retry',
-              reason: result.reason,
-            });
-            await emitOperationalHookEvent(cwd, 'retry-needed', {
-              team: teamName,
-              worker: request.to_worker,
-              request_id: request.request_id,
-              attempt: request.attempt_count,
-              command: request.trigger_message,
-              reason: result.reason,
-              status: 'retry-needed',
-            });
-            continue;
-          }
-          if (result.reason === 'tmux_send_keys_unconfirmed') {
-            request.status = 'failed';
-            request.failed_at = nowIso;
-            request.last_reason = 'unconfirmed_after_max_retries';
-            runtimeExec({ command: 'MarkFailed', request_id: request.request_id, reason: 'unconfirmed_after_max_retries' }, stateDir);
-            processed += 1;
-            failed += 1;
-            mutated = true;
-            await appendDispatchLog(logsDir, {
-              type: 'dispatch_failed',
-              team: teamName,
-              request_id: request.request_id,
-              worker: request.to_worker,
-              message_id: request.message_id || null,
-              reason: request.last_reason,
-              ...buildDispatchAttemptEvidence(result),
-            });
-            await appendDeliveryTelemetry(logsDir, {
-              event: 'dispatch_result',
-              team: teamName,
-              request_id: request.request_id,
-              message_id: request.message_id || null,
-              to_worker: request.to_worker,
-              transport: 'send-keys',
-              result: 'failed',
-              reason: request.last_reason,
-            });
-            await emitOperationalHookEvent(cwd, 'failed', {
-              team: teamName,
-              worker: request.to_worker,
-              request_id: request.request_id,
-              message_id: request.message_id || null,
-              command: request.trigger_message,
-              reason: request.last_reason,
-              error_summary: request.last_reason,
-              status: 'failed',
-            });
-            continue;
-          }
-          request.status = 'notified';
-          request.notified_at = nowIso;
-          request.last_reason = result.reason;
-          runtimeExec({ command: 'MarkNotified', request_id: request.request_id, channel: 'tmux' }, stateDir);
-          if (request.kind === 'mailbox' && request.message_id) {
-            runtimeExec({ command: 'MarkMailboxNotified', message_id: request.message_id }, stateDir);
-            if (usingLegacyRequests) {
-              await updateMailboxNotified(stateDir, teamName, request.to_worker, request.message_id).catch(() => {});
-            }
-          }
-          processed += 1;
-          mutated = true;
-          await appendDispatchLog(logsDir, {
-            type: 'dispatch_notified',
-            team: teamName,
-            request_id: request.request_id,
-            worker: request.to_worker,
-            message_id: request.message_id || null,
-            reason: result.reason,
-            ...buildDispatchAttemptEvidence(result),
-          });
-          await appendDeliveryTelemetry(logsDir, {
-            event: 'dispatch_result',
-            team: teamName,
-            request_id: request.request_id,
-            message_id: request.message_id || null,
-            to_worker: request.to_worker,
-            transport: 'send-keys',
-            result: 'notified',
-            reason: result.reason,
-          });
-        } else {
-          request.status = 'failed';
-          request.failed_at = nowIso;
-          request.last_reason = result.reason;
-          runtimeExec({ command: 'MarkFailed', request_id: request.request_id, reason: result.reason }, stateDir);
-          processed += 1;
-          failed += 1;
-          mutated = true;
-          await appendDispatchLog(logsDir, {
-            type: 'dispatch_failed',
-            team: teamName,
-            request_id: request.request_id,
-            worker: request.to_worker,
-            message_id: request.message_id || null,
-            reason: result.reason,
-            ...buildDispatchAttemptEvidence(result),
-          });
-          await appendDeliveryTelemetry(logsDir, {
-            event: 'dispatch_result',
-            team: teamName,
-            request_id: request.request_id,
-            message_id: request.message_id || null,
-            to_worker: request.to_worker,
-            transport: 'send-keys',
-            result: 'failed',
-            reason: result.reason,
-          });
-          await emitOperationalHookEvent(cwd, result.reason === LEADER_PANE_MISSING_DEFERRED_REASON ? 'handoff-needed' : 'failed', {
-            team: teamName,
-            worker: request.to_worker,
-            request_id: request.request_id,
-            message_id: request.message_id || null,
-            command: request.trigger_message,
-            reason: result.reason,
-            ...(result.reason === LEADER_PANE_MISSING_DEFERRED_REASON
-              ? { status: 'handoff-needed' }
-              : { status: 'failed', error_summary: result.reason }),
-          });
-        }
+        mutated = reserveDispatchCooldowns({
+          issueCooldownMs,
+          triggerCooldownMs,
+          issueCooldownByIssue,
+          triggerCooldownByKey,
+          issueKey,
+          triggerKey,
+          requestId: request.request_id,
+        }) || mutated;
+        claims.push({
+          request: { ...request },
+          lease,
+        });
       }
 
       if (mutated) {
@@ -874,6 +1102,37 @@ export async function drainPendingTeamDispatch({
         }
       }
     });
+
+    try {
+      for (const claim of claims) {
+        try {
+          const result = await injector(claim.request, config, resolve(cwd), stateDir);
+          const delta = await finalizeClaimedDispatchRequest({
+            claim,
+            result,
+            teamName,
+            teamDirPath,
+            config,
+            cwd,
+            stateDir,
+            logsDir,
+            issueCooldownMs,
+            triggerCooldownMs,
+          });
+          processed += delta.processed;
+          skipped += delta.skipped;
+          failed += delta.failed;
+        } finally {
+          claim.released = true;
+          await releaseDispatchRequestLease(claim.lease);
+        }
+      }
+    } finally {
+      for (const claim of claims) {
+        if (claim.released) continue;
+        await releaseDispatchRequestLease(claim.lease);
+      }
+    }
   }
 
   return { processed, skipped, failed };

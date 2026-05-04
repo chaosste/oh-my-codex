@@ -7,7 +7,7 @@ import { resolveCodexPane } from '../tmux-hook-engine.js';
 import { safeString } from './utils.js';
 
 const SESSION_ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
-const RALPH_TERMINAL_PHASES = new Set(['complete', 'failed', 'cancelled']);
+const RALPH_TERMINAL_PHASES = new Set(['blocked_on_user', 'complete', 'failed', 'cancelled']);
 const RALPH_RESUME_LOCK_STALE_MS = 10_000;
 const RALPH_RESUME_LOCK_TIMEOUT_MS = 5_000;
 const RALPH_RESUME_LOCK_RETRY_MS = 25;
@@ -128,7 +128,22 @@ function isActiveRalphCandidate(state: Record<string, unknown> | null): state is
   return state.active === true && !isTerminalRalphPhase(state.current_phase);
 }
 
-async function readCurrentOmxSessionId(stateDir: string): Promise<string> {
+function readSessionIdFromEnvironment(env: NodeJS.ProcessEnv = process.env): string {
+  const candidates = [env.OMX_SESSION_ID, env.CODEX_SESSION_ID, env.SESSION_ID];
+  for (const candidate of candidates) {
+    const sessionId = safeString(candidate).trim();
+    if (SESSION_ID_PATTERN.test(sessionId)) return sessionId;
+  }
+  return '';
+}
+
+async function readCurrentOmxSessionId(stateDir: string, env: NodeJS.ProcessEnv = process.env): Promise<string> {
+  const envSessionId = readSessionIdFromEnvironment(env);
+  if (envSessionId) {
+    const envScopedDir = join(stateDir, 'sessions', envSessionId);
+    if (existsSync(envScopedDir)) return envSessionId;
+  }
+
   const session = await readUsableSessionState(resolve(stateDir, '..', '..'));
   const sessionId = safeString(session?.session_id).trim();
   return SESSION_ID_PATTERN.test(sessionId) ? sessionId : '';
@@ -194,7 +209,7 @@ export async function reconcileRalphSessionResume({
   const lockedResult = await withRalphResumeLock(stateDir, async () => {
     await hooks?.afterLockAcquired?.();
 
-    const currentOmxSessionId = await readCurrentOmxSessionId(stateDir);
+    const currentOmxSessionId = await readCurrentOmxSessionId(stateDir, env);
     if (!currentOmxSessionId) {
       return {
         currentOmxSessionId: '',

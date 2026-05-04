@@ -4,6 +4,7 @@ import { existsSync, readFileSync } from 'fs';
 import { isAbsolute, join, resolve } from 'path';
 import {
   CODEX_BYPASS_FLAG,
+  CLAUDE_SKIP_PERMISSIONS_FLAG,
   MADMAX_FLAG,
   CONFIG_FLAG,
   LONG_CONFIG_FLAG,
@@ -20,6 +21,7 @@ import {
   paneLooksReady as sharedPaneLooksReady,
 } from '../scripts/tmux-hook-engine.js';
 import { readActiveProviderEnvOverrides } from '../config/models.js';
+import { extractModelProviderOverrideValue } from './model-contract.js';
 import { sleep, sleepSync } from '../utils/sleep.js';
 import {
   buildPlatformCommandSpec,
@@ -31,6 +33,9 @@ import { resolveOmxCliEntryPath } from '../utils/paths.js';
 
 const execFileAsync = promisify(execFile);
 import { HUD_RESIZE_RECONCILE_DELAY_SECONDS, HUD_TMUX_TEAM_HEIGHT_LINES } from '../hud/constants.js';
+
+const OMX_INSTANCE_OPTION = '@omx_instance_id';
+const OMX_PANE_INSTANCE_OPTION = '@omx_pane_instance_id';
 
 export interface TeamSession {
   name: string; // tmux target in "session:window" form
@@ -55,12 +60,19 @@ const OMX_TEAM_WORKER_CLI_ENV = 'OMX_TEAM_WORKER_CLI';
 const OMX_TEAM_WORKER_CLI_MAP_ENV = 'OMX_TEAM_WORKER_CLI_MAP';
 const OMX_TEAM_WORKER_LAUNCH_MODE_ENV = 'OMX_TEAM_WORKER_LAUNCH_MODE';
 const OMX_TEAM_AUTO_INTERRUPT_RETRY_ENV = 'OMX_TEAM_AUTO_INTERRUPT_RETRY';
-const CLAUDE_SKIP_PERMISSIONS_FLAG = '--dangerously-skip-permissions';
 const GEMINI_PROMPT_INTERACTIVE_FLAG = '-i';
 const GEMINI_APPROVAL_MODE_FLAG = '--approval-mode';
 const GEMINI_APPROVAL_MODE_YOLO = 'yolo';
 const OMX_LEADER_NODE_PATH_ENV = 'OMX_LEADER_NODE_PATH';
 const OMX_LEADER_CLI_PATH_ENV = 'OMX_LEADER_CLI_PATH';
+const TMUX_WORKER_AMBIENT_ENV_ALLOWLIST = [
+  'HTTPS_PROXY',
+  'HTTP_PROXY',
+  'NO_PROXY',
+  'https_proxy',
+  'http_proxy',
+  'no_proxy',
+] as const;
 const TMUX_NO_UNDERLINE_STYLE_FLAGS = [
   'nounderscore',
   'nodouble-underscore',
@@ -72,6 +84,9 @@ const TMUX_COPY_MODE_STYLE_OPTIONS = [
   'mode-style',
   'copy-mode-selection-style',
 ] as const;
+const TMUX_PANE_STABILITY_POLL_MS = 60;
+const TMUX_PANE_STABILITY_POLLS_REQUIRED = 2;
+const TMUX_PANE_STABILITY_TIMEOUT_MS = 750;
 
 export type TeamWorkerCli = 'codex' | 'claude' | 'gemini';
 type TeamWorkerCliMode = 'auto' | TeamWorkerCli;
@@ -140,6 +155,16 @@ function sanitizeTmuxStyleOption(sessionTarget: string, optionName: string): boo
 
   const result = runTmux(['set-option', '-t', sessionTarget, optionName, sanitized]);
   return result.ok;
+}
+
+function tagPaneInstance(paneTarget: string, instanceId: string): void {
+  const target = paneTarget.trim();
+  const sanitized = instanceId.trim();
+  if (!target || !sanitized) return;
+  const result = runTmux(['set-option', '-p', '-t', target, OMX_PANE_INSTANCE_OPTION, sanitized]);
+  if (!result.ok) {
+    throw new Error(`failed to tag tmux pane ${target}: ${result.stderr}`);
+  }
 }
 
 export function mitigateCopyModeUnderlineArtifacts(sessionTarget: string): boolean {
@@ -225,6 +250,38 @@ export function listPaneIds(target: string): string[] {
   return listPanes(target).map((pane) => pane.paneId);
 }
 
+function paneExistsInTarget(target: string, paneId: string): boolean {
+  if (!paneId.startsWith('%')) return false;
+  return listPaneIds(target).includes(paneId);
+}
+
+function waitForPaneToRemainPresent(
+  target: string,
+  paneId: string,
+  timeoutMs: number = TMUX_PANE_STABILITY_TIMEOUT_MS,
+): boolean {
+  if (!paneId.startsWith('%')) return false;
+
+  const stablePollsRequired = Math.max(1, TMUX_PANE_STABILITY_POLLS_REQUIRED);
+  const startedAt = Date.now();
+  let stablePolls = 0;
+
+  while (Date.now() - startedAt <= timeoutMs) {
+    if (paneExistsInTarget(target, paneId)) {
+      stablePolls += 1;
+      if (stablePolls >= stablePollsRequired) return true;
+    } else {
+      stablePolls = 0;
+    }
+
+    const remaining = timeoutMs - (Date.now() - startedAt);
+    if (remaining <= 0) break;
+    sleepFractionalSeconds(Math.max(0, Math.min(TMUX_PANE_STABILITY_POLL_MS, remaining)) / 1000);
+  }
+
+  return false;
+}
+
 function isHudWatchPane(pane: TmuxPaneInfo): boolean {
   const start = pane.startCommand || '';
   return /\bomx\b.*\bhud\b.*--watch/i.test(start);
@@ -295,6 +352,12 @@ async function capturePaneAsync(target: string): Promise<string> {
   return result.stdout;
 }
 
+async function captureVisiblePaneAsync(target: string): Promise<string> {
+  const result = await runTmuxAsync(sharedBuildVisibleCapturePaneArgv(target));
+  if (!result.ok) return '';
+  return result.stdout;
+}
+
 async function isWorkerAliveAsync(sessionName: string, workerIndex: number, workerPaneId?: string): Promise<boolean> {
   const result = await runTmuxAsync([
     'list-panes',
@@ -334,6 +397,30 @@ function quotePowerShellArg(value: string): string {
 
 function encodePowerShellCommand(commandText: string): string {
   return Buffer.from(commandText, 'utf16le').toString('base64');
+}
+
+function resolveNativeWindowsPowerShellPath(env: NodeJS.ProcessEnv = process.env): string {
+  const rootCandidates = [
+    env.SystemRoot,
+    env.SYSTEMROOT,
+    env.windir,
+    env.WINDIR,
+  ]
+    .map((value) => (typeof value === 'string' ? value.trim() : ''))
+    .filter((value, index, values) => value !== '' && values.indexOf(value) === index);
+  const systemPowerShellCandidates = rootCandidates.map(
+    (root) => `${root.replace(/[\\/]+$/, '')}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe`,
+  );
+  const resolvedFromPath = resolveCommandPathForPlatform('powershell', process.platform, env);
+  const existingCandidates = [
+    ...systemPowerShellCandidates,
+    resolvedFromPath,
+  ].filter((candidate): candidate is string => Boolean(candidate && existsSync(candidate)));
+
+  return existingCandidates.find((candidate) => !/\s/.test(candidate))
+    ?? existingCandidates[0]
+    ?? resolvedFromPath
+    ?? 'powershell.exe';
 }
 
 function normalizeTmuxHookToken(value: string): string {
@@ -493,7 +580,7 @@ export function buildReconcileHudResizeArgs(
   return ['run-shell', buildBestEffortShellCommand(buildNestedTmuxShellCommand(buildHudResizeCommand(hudPaneId, heightLines)))];
 }
 
-const ZSH_CANDIDATE_PATHS = ['/bin/zsh', '/usr/bin/zsh', '/usr/local/bin/zsh', '/opt/homebrew/bin/zsh'];
+const ZSH_CANDIDATE_PATHS = ['/bin/zsh', '/usr/bin/zsh', '/usr/local/bin/zsh', '/opt/local/bin/zsh', '/opt/homebrew/bin/zsh'];
 const BASH_CANDIDATE_PATHS = ['/bin/bash', '/usr/bin/bash'];
 
 function buildShellLaunchSpec(shell: string, rcFile: string | null): WorkerLaunchSpec {
@@ -739,6 +826,16 @@ function buildModelInstructionsOverride(cwd: string, env: NodeJS.ProcessEnv): st
   return `${MODEL_INSTRUCTIONS_FILE_KEY}="${escapeTomlString(filePath)}"`;
 }
 
+function readTmuxWorkerAmbientEnv(env: NodeJS.ProcessEnv = process.env): Record<string, string> {
+  const inherited: Record<string, string> = {};
+  for (const key of TMUX_WORKER_AMBIENT_ENV_ALLOWLIST) {
+    const value = env[key];
+    if (typeof value !== 'string' || value.trim() === '') continue;
+    inherited[key] = value;
+  }
+  return inherited;
+}
+
 function resolveWorkerLaunchArgs(extraArgs: string[] = [], cwd: string = process.cwd(), env: NodeJS.ProcessEnv = process.env): string[] {
   const merged = [...extraArgs];
   const wantsBypass = process.argv.includes(CODEX_BYPASS_FLAG) || process.argv.includes(MADMAX_FLAG);
@@ -771,15 +868,20 @@ export function buildWorkerStartupCommand(
     initialPrompt,
     workerRole,
   );
+  const startupEnv = {
+    ...readTmuxWorkerAmbientEnv(process.env),
+    ...processSpec.env,
+  };
   const resolvedLeaderNodePath = processSpec.env[OMX_LEADER_NODE_PATH_ENV]?.trim() || resolveLeaderNodePath();
   const leaderNodeDir = /[\\/]/.test(resolvedLeaderNodePath)
     ? resolvedLeaderNodePath.replace(/[\\/][^\\/]+$/, '')
     : '';
   if (isNativeWindows()) {
+    const powershellPath = resolveNativeWindowsPowerShellPath();
     const pathBootstrap = leaderNodeDir
       ? `$env:PATH = ${quotePowerShellArg(`${leaderNodeDir};`)} + $env:PATH`
       : '';
-    const envAssignments = Object.entries(processSpec.env)
+    const envAssignments = Object.entries(startupEnv)
       .map(([key, value]) => `$env:${key} = ${quotePowerShellArg(value)}`)
       .join('; ');
     const invocation = ['&', quotePowerShellArg(processSpec.command), ...processSpec.args.map(quotePowerShellArg)].join(' ');
@@ -791,16 +893,17 @@ export function buildWorkerStartupCommand(
         invocation,
       ].filter(Boolean).join('; '),
     );
-    return `powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -EncodedCommand ${encodedCommand}`;
+    return `${powershellPath} -NoLogo -NoProfile -ExecutionPolicy Bypass -EncodedCommand ${encodedCommand}`;
   }
 
   const launchSpec = buildWorkerLaunchSpec(process.env.SHELL);
-  const pathPrefix = leaderNodeDir ? `export PATH='${leaderNodeDir}':$PATH; ` : '';
+  const pathPrefix = leaderNodeDir ? `export PATH=${shellQuoteSingle(leaderNodeDir)}:$PATH; ` : '';
   const quotedArgs = processSpec.args.map(shellQuoteSingle).join(' ');
-  const cliInvocation = quotedArgs.length > 0 ? `exec ${processSpec.command} ${quotedArgs}` : `exec ${processSpec.command}`;
+  const quotedCommand = shellQuoteSingle(processSpec.command);
+  const cliInvocation = quotedArgs.length > 0 ? `exec ${quotedCommand} ${quotedArgs}` : `exec ${quotedCommand}`;
   const rcPrefix = launchSpec.rcFile ? `if [ -f ${launchSpec.rcFile} ]; then source ${launchSpec.rcFile}; fi; ` : '';
   const inner = `${rcPrefix}${pathPrefix}${cliInvocation}`;
-  const envParts = Object.entries(processSpec.env).map(([key, value]) => `${key}=${value}`);
+  const envParts = Object.entries(startupEnv).map(([key, value]) => `${key}=${value}`);
 
   return `env ${envParts.map(shellQuoteSingle).join(' ')} ${shellQuoteSingle(launchSpec.shell)} -c ${shellQuoteSingle(inner)}`;
 }
@@ -836,16 +939,32 @@ export function buildWorkerProcessLaunchSpec(
     ? buildPlatformCommandSpec(workerCli, effectiveCliLaunchArgs, process.platform, effectiveEnv)
     : { command: resolvedCliPath, args: effectiveCliLaunchArgs };
   const resolvedLauncherPath = platformSpec.resolvedPath || resolvedCliPath;
+  const modelProviderOverride = workerCli === 'codex'
+    ? extractModelProviderOverrideValue(effectiveCliLaunchArgs)
+    : undefined;
+  const codexProviderEnv = workerCli === 'codex'
+    ? readActiveProviderEnvOverrides(
+        effectiveEnv,
+        providerLookupCodexHome,
+        modelProviderOverride,
+      )
+    : {};
+  const internalWorkerIdentity = `${teamName}/worker-${workerIndex}`;
+  const displayTeamName = typeof extraEnv.OMX_TEAM_DISPLAY_NAME === 'string'
+    ? extraEnv.OMX_TEAM_DISPLAY_NAME.trim()
+    : '';
+  const publicWorkerIdentity = displayTeamName
+    ? `${displayTeamName}/worker-${workerIndex}`
+    : internalWorkerIdentity;
   const workerEnv: Record<string, string> = {
-    OMX_TEAM_WORKER: `${teamName}/worker-${workerIndex}`,
+    OMX_TEAM_WORKER: publicWorkerIdentity,
+    OMX_TEAM_INTERNAL_WORKER: internalWorkerIdentity,
     [OMX_LEADER_NODE_PATH_ENV]: resolveLeaderNodePath(),
     [OMX_LEADER_CLI_PATH_ENV]: resolvedLauncherPath,
-    ...(workerCli === 'codex'
-      ? readActiveProviderEnvOverrides(
-          effectiveEnv,
-          providerLookupCodexHome,
-        )
+    ...(workerCli === 'codex' && workerCodexHomeOverride
+      ? { CODEX_HOME: workerCodexHomeOverride }
       : {}),
+    ...codexProviderEnv,
   };
   for (const [key, value] of Object.entries(extraEnv)) {
     if (typeof value !== 'string' || value.trim() === '') continue;
@@ -963,8 +1082,16 @@ export function createTeamSession(
       throw new Error(`failed to parse current tmux target: ${context.stdout}`);
     }
     const teamTarget = `${sessionName}:${windowIndex}`;
+    const instanceId = (process.env.OMX_SESSION_ID || '').trim();
+    if (instanceId) {
+      const tagResult = runTmux(['set-option', '-t', sessionName, OMX_INSTANCE_OPTION, instanceId]);
+      if (!tagResult.ok) {
+        throw new Error(`failed to tag tmux session ${sessionName}: ${tagResult.stderr}`);
+      }
+    }
     const panes = listPanes(teamTarget);
     const leaderPaneId = chooseTeamLeaderPaneId(panes, detectedLeaderPaneId);
+    tagPaneInstance(leaderPaneId, instanceId);
     const initialHudPaneIds = findHudPaneIds(teamTarget, leaderPaneId);
     // Team mode prioritizes leader + worker visibility. Remove HUD panes in this window
     // to keep a clean "leader left / workers right" layout.
@@ -1013,8 +1140,12 @@ export function createTeamSession(
       if (!paneId || !paneId.startsWith('%')) {
         throw new Error(`failed to capture worker pane id for worker ${i}`);
       }
-      workerPaneIds.push(paneId);
       rollbackPaneIds.push(paneId);
+      if (isNativeWindows() && !waitForPaneToRemainPresent(teamTarget, paneId)) {
+        throw new Error(`worker pane ${i} did not remain present after tmux split-window returned ${paneId}`);
+      }
+      tagPaneInstance(paneId, instanceId);
+      workerPaneIds.push(paneId);
       if (i === 1) rightStackRootPaneId = paneId;
     }
 
@@ -1049,8 +1180,12 @@ export function createTeamSession(
       if (hudResult.ok) {
         const id = hudResult.stdout.split('\n')[0]?.trim() ?? '';
         if (id.startsWith('%')) {
+          rollbackPaneIds.push(id);
+          if (isNativeWindows() && !waitForPaneToRemainPresent(teamTarget, id)) {
+            throw new Error(`HUD pane did not remain present after tmux split-window returned ${id}`);
+          }
+          tagPaneInstance(id, instanceId);
           hudPaneId = id;
-          rollbackPaneIds.push(hudPaneId);
 
           if (isNativeWindows()) {
             // Native Windows tmux support may flow through psmux; issuing a
@@ -1238,6 +1373,33 @@ function paneHasClaudeBypassPermissionsPrompt(captured: string): boolean {
   return hasWarning && hasChoices;
 }
 
+
+export type StartupDirectTriggerSafety =
+  | { safe: true; reason: 'ready_prompt' | 'codex_viewport' }
+  | { safe: false; reason: 'tmux_unavailable' | 'capture_failed' | 'trust_prompt' | 'claude_bypass_prompt' | 'bootstrapping' | 'not_agent_viewport' };
+
+export function evaluateStartupDirectTriggerSafetyCapture(captured: string, workerCli?: TeamWorkerCli): StartupDirectTriggerSafety {
+  if (paneHasTrustPrompt(captured)) return { safe: false, reason: 'trust_prompt' };
+  if (paneHasClaudeBypassPermissionsPrompt(captured)) return { safe: false, reason: 'claude_bypass_prompt' };
+  if (paneLooksReady(captured)) return { safe: true, reason: 'ready_prompt' };
+  if (paneIsBootstrapping(captured)) return { safe: false, reason: 'bootstrapping' };
+  if (workerCli === 'codex' && sharedPaneShowsCodexViewport(captured)) return { safe: true, reason: 'codex_viewport' };
+  return { safe: false, reason: 'not_agent_viewport' };
+}
+
+export async function evaluateStartupDirectTriggerSafety(
+  sessionName: string,
+  workerIndex: number,
+  workerPaneId?: string,
+  workerCli?: TeamWorkerCli,
+): Promise<StartupDirectTriggerSafety> {
+  if (!isTmuxAvailable()) return { safe: false, reason: 'tmux_unavailable' };
+  const target = paneTarget(sessionName, workerIndex, workerPaneId);
+  const result = await runTmuxAsync(sharedBuildVisibleCapturePaneArgv(target));
+  if (!result.ok) return { safe: false, reason: 'capture_failed' };
+  return evaluateStartupDirectTriggerSafetyCapture(result.stdout, workerCli);
+}
+
 function acceptClaudeBypassPermissionsPrompt(target: string): void {
   runTmux(['send-keys', '-t', target, '-l', '--', '2']);
   sleepFractionalSeconds(0.12);
@@ -1252,6 +1414,45 @@ function dismissClaudeBypassPermissionsPromptIfPresent(target: string, captured:
 }
 
 export const paneHasActiveTask = sharedPaneHasActiveTask;
+
+export type WorkerStartupInjectSafety =
+  | 'safe'
+  | 'trust_prompt'
+  | 'claude_bypass_prompt'
+  | 'bootstrapping'
+  | 'active_task'
+  | 'not_ready';
+
+export function classifyWorkerStartupInjectSafety(captured: string): WorkerStartupInjectSafety {
+  if (paneHasTrustPrompt(captured)) return 'trust_prompt';
+  if (paneHasClaudeBypassPermissionsPrompt(captured)) return 'claude_bypass_prompt';
+  if (paneIsBootstrapping(captured)) return 'bootstrapping';
+  if (paneHasActiveTask(captured)) return 'active_task';
+  if (!paneLooksReady(captured)) return 'not_ready';
+  return 'safe';
+}
+
+export async function checkWorkerStartupInjectSafety(
+  sessionName: string,
+  workerIndex: number,
+  workerPaneId?: string,
+): Promise<{ safe: true; reason: 'safe' } | { safe: false; reason: Exclude<WorkerStartupInjectSafety, 'safe'> }> {
+  const target = paneTarget(sessionName, workerIndex, workerPaneId);
+  const visibleCapture = await captureVisiblePaneAsync(target);
+  const visibleSafety = classifyWorkerStartupInjectSafety(visibleCapture);
+  if (visibleSafety === 'safe') return { safe: true, reason: 'safe' };
+  if (visibleSafety !== 'not_ready') return { safe: false, reason: visibleSafety };
+
+  if (!sharedPaneShowsCodexViewport(visibleCapture)) {
+    return { safe: false, reason: visibleSafety };
+  }
+
+  const scrollbackCapture = await capturePaneAsync(target);
+  const scrollbackSafety = classifyWorkerStartupInjectSafety(scrollbackCapture);
+  return scrollbackSafety === 'safe'
+    ? { safe: true, reason: 'safe' }
+    : { safe: false, reason: scrollbackSafety };
+}
 
 function resolveSendStrategyFromEnv(): 'auto' | 'queue' | 'interrupt' {
   const raw = String(process.env.OMX_TEAM_SEND_STRATEGY || '')
@@ -1345,6 +1546,13 @@ function sendLiteralTextOrThrow(target: string, text: string): void {
   }
 }
 
+function paneHasQueuedCodexSubmission(captured: string | null | undefined): boolean {
+  const normalized = normalizeTmuxCapture(captured ?? '');
+  if (normalized === '') return false;
+  return /messages to be submitted after next tool call/i.test(normalized)
+    || /press esc to interrupt and send immediately/i.test(normalized);
+}
+
 async function attemptSubmitRounds(
   target: string,
   text: string,
@@ -1368,16 +1576,22 @@ async function attemptSubmitRounds(
       }
     }
     await sleep(140);
-    const captured = await capturePaneAsync(target);
-    if (!normalizeTmuxCapture(captured).includes(normalizeTmuxCapture(text))) return true;
+    const [captured, visibleCapture] = await Promise.all([
+      capturePaneAsync(target),
+      captureVisiblePaneAsync(target),
+    ]);
+    const normalizedCapture = normalizeTmuxCapture(captured);
+    if (
+      !normalizedCapture.includes(normalizeTmuxCapture(text))
+      && !paneHasQueuedCodexSubmission(visibleCapture)
+    ) {
+      return true;
+    }
     await sleep(140);
   }
   return false;
 }
 
-// Poll tmux capture-pane for a worker-ready Codex/Claude prompt or welcome screen.
-// Start with short waits so we notice the first ready frame quickly, then back off.
-// Returns true if ready, false on timeout.
 export function waitForWorkerReady(
   sessionName: string,
   workerIndex: number,
@@ -1445,6 +1659,82 @@ export function waitForWorkerReady(
     const remaining = timeoutMs - (Date.now() - startedAt);
     if (remaining <= 0) break;
     sleepSeconds(Math.max(0, Math.min(delayMs, remaining)) / 1000);
+    delayMs = Math.min(maxBackoffMs, delayMs * 2);
+  }
+
+  return false;
+}
+
+// Async twin of waitForWorkerReady for team startup fan-out. Keep the readiness
+// semantics mirrored with the synchronous helper above, but yield between polls
+// so one slow worker pane cannot block later workers' startup attempts.
+export async function waitForWorkerReadyAsync(
+  sessionName: string,
+  workerIndex: number,
+  timeoutMs: number = 30_000,
+  workerPaneId?: string,
+): Promise<boolean> {
+  const initialBackoffMs = 150;
+  const maxBackoffMs = 8000;
+  const startedAt = Date.now();
+  let blockedByTrustPrompt = false;
+  let promptDismissed = false;
+
+  const sendRobustEnter = async (): Promise<void> => {
+    const target = paneTarget(sessionName, workerIndex, workerPaneId);
+    // Trust + follow-up splash can require two submits in Codex TUI.
+    // Use C-m (carriage return) for raw-mode compatibility.
+    await runTmuxAsync(['send-keys', '-t', target, 'C-m']);
+    await sleep(120);
+    await runTmuxAsync(['send-keys', '-t', target, 'C-m']);
+  };
+
+  const check = async (): Promise<boolean> => {
+    const target = paneTarget(sessionName, workerIndex, workerPaneId);
+    const result = await runTmuxAsync(sharedBuildVisibleCapturePaneArgv(target));
+    if (!result.ok) return false;
+    if (dismissClaudeBypassPermissionsPromptIfPresent(target, result.stdout)) {
+      promptDismissed = true;
+      return false;
+    }
+    if (paneHasClaudeBypassPermissionsPrompt(result.stdout)) {
+      return false;
+    }
+    if (paneHasTrustPrompt(result.stdout)) {
+      // Default-on for team workers: they are spawned explicitly by the leader in the same cwd.
+      // Opt-out by setting OMX_TEAM_AUTO_TRUST=0.
+      if (process.env.OMX_TEAM_AUTO_TRUST !== '0') {
+        await sendRobustEnter();
+        promptDismissed = true;
+        return false;
+      }
+      blockedByTrustPrompt = true;
+      return false;
+    }
+    if (paneLooksReady(result.stdout)) return true;
+    // Keep startup safety checks anchored to the visible pane. Only if the
+    // visible slice already proves a live Codex viewport do we consult recent
+    // scrollback for the prompt/helper text that may have slipped below the fold.
+    if (!sharedPaneShowsCodexViewport(result.stdout)) return false;
+
+    const scrollbackResult = await runTmuxAsync(sharedBuildCapturePaneArgv(target, 80));
+    if (!scrollbackResult.ok) return false;
+    return paneLooksReady(scrollbackResult.stdout);
+  };
+
+  let delayMs = initialBackoffMs;
+  while (Date.now() - startedAt < timeoutMs) {
+    if (await check()) return true;
+    if (blockedByTrustPrompt) return false;
+    // After dismissing a trust prompt, reset backoff so we re-check quickly
+    // instead of sleeping 2s/4s/8s while the worker is starting up.
+    if (promptDismissed) {
+      delayMs = initialBackoffMs;
+      promptDismissed = false;
+    }
+    const remaining = timeoutMs - (Date.now() - startedAt);
+    if (remaining <= 0) break;
+    await sleep(Math.max(0, Math.min(delayMs, remaining)));
     delayMs = Math.min(maxBackoffMs, delayMs * 2);
   }
 
@@ -1580,14 +1870,26 @@ export async function sendToWorker(
   // Post-submit verification: wait briefly and confirm the worker consumed the
   // trigger (draft disappeared or active-task indicator appeared). Fixes #391.
   await sleep(300);
-  const verifyCapture = await capturePaneAsync(target);
+  const [verifyCapture, verifyVisibleCapture] = await Promise.all([
+    capturePaneAsync(target),
+    captureVisiblePaneAsync(target),
+  ]);
   if (verifyCapture) {
     if (paneHasActiveTask(verifyCapture)) return;
-    if (!normalizeTmuxCapture(verifyCapture).includes(normalizeTmuxCapture(text))) return;
+    if (
+      !normalizeTmuxCapture(verifyCapture).includes(normalizeTmuxCapture(text))
+      && !paneHasQueuedCodexSubmission(verifyVisibleCapture)
+    ) {
+      return;
+    }
     // Draft still visible and no active task — one more C-m attempt.
     await sendKeyAsync(target, 'C-m');
     await sleep(150);
     await sendKeyAsync(target, 'C-m');
+    const finalVisibleCapture = await captureVisiblePaneAsync(target);
+    if (paneHasQueuedCodexSubmission(finalVisibleCapture)) {
+      throw new Error('sendToWorker: submit_queued_after_tool_call');
+    }
   }
 }
 
